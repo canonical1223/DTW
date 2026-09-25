@@ -4769,7 +4769,7 @@ DTW фиксирует концы выбранных интервалов: эт�
 МАРКЕРЫ И ПРОВЕРКА
 Обязательные заголовки markers.xlsx: Маркер, Скважина, UWI, MD, X, Y, Z. MD задаётся в метрах. X/Y/Z сохраняются как метаданные; вертикальная ось сравнения — MD, а не абсолютная отметка Z.
 Маркеры опорной скважины переносятся по пути DTW. В обычном и многовариантном режиме известные маркеры целевой используются только для проверки. Ошибка — прогноз минус известная MD. MAE считается только по проверяемым автоматическим переносам; ручные правки исключены. Покрытие нужно оценивать отдельно.
-В режиме «Подобрать настройки по разметке» проверяется набор комбинаций параметров. Выбирается минимальная средняя абсолютная ошибка со штрафом за каждый пропуск. Используются исходные и подтверждённые пользователем контрольные маркеры. Это подбор на известных ответах; его ошибка не является независимой проверкой и лучший вариант не является доказанным глобальным оптимумом. Примените выбранные параметры кнопкой в отдельном окне результата.
+В режиме «Подобрать настройки по разметке» проверяется набор комбинаций параметров. Выбирается минимальная средняя абсолютная ошибка со штрафом за каждый пропуск. Используются исходные и подтверждённые пользователем контрольные маркеры. Это подбор на известных ответах; его ошибка не является независимой проверкой и лучший вариант не является доказанным глобальным оптимумом. Лучшие параметры автоматически записываются в окно настроек после завершения подбора и сохраняются при смене скважин. Кнопка в окне результата позволяет повторно применить параметры выбранного результата. Сохранение проекта сохраняет и текущие настройки.
 Многовариантный режим выбирает реальный путь из наиболее поддержанной группы решений, а не усредняет разные границы. P10–P90 показывает чувствительность внутри этой группы; альтернативные группы отображаются отдельно. Поддержка не является вероятностью правильности. Провальные генерации учитываются в знаменателе поддержки.
 Ручную MD можно изменить и подтвердить двойным щелчком в таблице отдельного окна. История сохраняется. Последующие пары после такой правки устаревают; кнопка «Пересчитать после этой скважины» использует исправленные границы как исходные для переноса дальше. Подтверждённые правки сохраняются при пересчётах; конфликты отмечаются явно.
 Для неизвестного UWI выбирайте группу вручную. При отсутствии маркеров по-прежнему можно сравнить каротаж и путь корреляции.
@@ -5602,6 +5602,7 @@ class IDTWApp(PairApp):
         self.sequence_status.configure(text=f'Рассчитано пар: {len(self.bundles)}' + ('; '+ '; '.join(payload['errors']) if payload['errors'] else ''))
         self._refresh_result_windows()
         if payload['mode']=='tune' and self.bundles:
+            self._apply_best(0,show_settings=False)
             self._open_result()
         if payload['errors']:
             messagebox.showwarning('Последовательность остановлена', '\n'.join(payload['errors']),parent=self)
@@ -5627,29 +5628,38 @@ class IDTWApp(PairApp):
         self._show_result()
         self._refresh_result_windows()
 
-    def _apply_best(self,index):
+    def _apply_best(self,index,show_settings=True):
         result=self.bundles[index].result
         if result.provenance.get('mode')=='tuned':
             self.calibration_context[result.target.path]=dict(source=result.ref.path,
                 control_names=result.provenance.get('control_names',[]),params=asdict(result.params))
+        previous_guard=self._guard
+        curve_state=self.curve_list.cget('state')
         self._guard=True
-        for key,value in asdict(result.params).items():
-            self.vars[key].set('' if value is None else str(value))
-        labels=list(self.wells)
-        self.ref_var.set(next(k for k in labels if self.wells[k].path==result.ref.path))
-        self.target_var.set(next(k for k in labels if self.wells[k].path==result.target.path))
-        self.rgroup_var.set(self.assignments.get(result.ref.path,match_group(result.ref,self.groups)))
-        self.tgroup_var.set(self.assignments.get(result.target.path,match_group(result.target,self.groups)))
-        self.curve_list.delete(0,'end')
-        common=sorted(set(result.ref.curves)&set(result.target.curves))
-        for i,name in enumerate(common):
-            self.curve_list.insert('end',name)
-            if name in result.curves:
-                self.curve_list.selection_set(i)
-        self._guard=False
+        try:
+            for key,value in asdict(result.params).items():
+                self.vars[key].set('' if value is None else str(value))
+            labels=list(self.wells)
+            self.ref_var.set(next(k for k in labels if self.wells[k].path==result.ref.path))
+            self.target_var.set(next(k for k in labels if self.wells[k].path==result.target.path))
+            self.rgroup_var.set(self.assignments.get(result.ref.path,match_group(result.ref,self.groups)))
+            self.tgroup_var.set(self.assignments.get(result.target.path,match_group(result.target,self.groups)))
+            # Worker results arrive before the controls are re-enabled. Tk ignores
+            # selection changes on a disabled Listbox, so restore its state locally.
+            self.curve_list.configure(state='normal')
+            self.curve_list.delete(0,'end')
+            common=sorted(set(result.ref.curves)&set(result.target.curves))
+            for i,name in enumerate(common):
+                self.curve_list.insert('end',name)
+                if name in result.curves:
+                    self.curve_list.selection_set(i)
+        finally:
+            self.curve_list.configure(state=curve_state)
+            self._guard=previous_guard
         self.dirty=True
         self.status.set('Параметры лучшего проверенного варианта применены. Оценка остаётся результатом подбора.')
-        self._settings()
+        if show_settings:
+            self._settings()
 
     def _project_ui(self):
         return dict(params={k:v.get() for k,v in self.vars.items()},config={k:v.get() for k,v in self.config_vars.items()},
@@ -6253,6 +6263,11 @@ def advanced_gui_smoke():
         app._run_mode('tune')
         drain()
         assert app.bundles[0].result.provenance['mode']=='tuned'
+        winner=app.bundles[0].result
+        assert asdict(app._read_params())==asdict(winner.params)
+        assert app._selected_curves()==winner.curves
+        assert app.calibration_context[target.path]['params']==asdict(winner.params)
+        assert app.result is winner and not winner.provenance.get('settings_changed')
         window=app.result_windows[-1]
         window.pair_var.set(window.pair_box['values'][1])
         window.refresh()
@@ -6261,8 +6276,17 @@ def advanced_gui_smoke():
         assert window.viewed()[0][1] in app.bundles[0].candidates
         window.variant_var.set('Итог')
         window.refresh()
-        app._apply_best(0)
-        assert float(app.vars['step'].get())==app.bundles[0].result.params.step
+        saved_params={k:v.get() for k,v in app.vars.items()}
+        saved_config={k:v.get() for k,v in app.config_vars.items()}
+        original_pair=(app.ref_var.get(),app.target_var.get())
+        labels=list(app.wells)
+        for ref_label,target_label in ((labels[1],labels[2]),(labels[2],labels[0]),original_pair):
+            app.ref_var.set(ref_label)
+            app.target_var.set(target_label)
+            app._pair_changed()
+            app.update()
+            assert {k:v.get() for k,v in app.vars.items()}==saved_params
+            assert {k:v.get() for k,v in app.config_vars.items()}==saved_config
         app.settings_dialog.withdraw()
         app._run_mode('pair')
         drain()
@@ -6278,9 +6302,11 @@ def advanced_gui_smoke():
             drain()
             assert len(app.wells)==3 and len(app.bundles)==1 and app.manual_picks[target.path]
             assert app.sequence_paths==[ref.path,target.path,third.path]
+            assert {k:v.get() for k,v in app.vars.items()}==saved_params
+            assert {k:v.get() for k,v in app.config_vars.items()}==saved_config
         if failures:
             raise AssertionError(str(failures))
-        print('PASS: advanced GUI auto intervals, drag/drop, three wells, result window, wheel/Shift, manual pick, downstream recalculation, tuning, variant switch, apply settings, project save/load.')
+        print('PASS: advanced GUI auto intervals, drag/drop, three wells, result window, wheel/Shift, manual pick, downstream recalculation, tuning, variant switch, automatic settings, unchanged settings on well switch, project save/load.')
     finally:
         app._close()
         messagebox.showerror,messagebox.showwarning=old_error,old_warning
