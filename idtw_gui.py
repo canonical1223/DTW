@@ -9,11 +9,14 @@ Checks:  python idtw_gui.py --self-test
 All application and LAS parser code is in this file. No runtime downloads.
 LAS MD may be M or FT (converted to metres); markers.xlsx MD must be metres.
 Excel columns: Маркер, Скважина, UWI, MD, X, Y, Z. Coordinates may be blank.
-UWI should be stored as text. Target markers are held out from optimisation.
+UWI should be stored as text. Normal/consensus runs hold target markers out of
+optimisation. The explicit tuning mode uses them to rank parameter settings;
+its error is labelled as calibration, never independent validation.
 
 Method: Fang et al. 2021, doi:10.1190/INT-2020-0172.1, eq.4.
 Engineering choices are documented in correlate() and the GUI help.
-This is a pairwise implementation, not global multi-well stratigraphic inference.
+Supports sequential pairwise multi-well correlation, ensemble alternatives,
+manual picks and self-contained .idtw projects. It is not a global solver.
 """
 import sys
 if sys.version_info < (3, 10):
@@ -3251,6 +3254,13 @@ import threading
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from dataclasses import asdict, replace
+import copy
+import hashlib
+import colorsys
+import itertools
+import time
+import zipfile
 
 import numpy as np
 from openpyxl import load_workbook
@@ -3309,6 +3319,9 @@ class Result:
     rows: list
     stats: dict
     notes: list
+    reference_markers: list = field(default_factory=list)
+    control_markers: list = field(default_factory=list)
+    provenance: dict = field(default_factory=dict)
 
 
 class Cancelled(Exception):
@@ -3890,7 +3903,7 @@ def correlate(ref, target, curves, params, ref_markers, target_markers,
     }
     progress(1., 'Готово')
     return Result(ref, target, curves, params, zr, zt, xr, xt, path, mapped,
-                  similarity, rows, stats, notes)
+                  similarity, rows, stats, notes, list(ref_markers), list(target_markers))
 
 
 def _synthetic_case():
@@ -4021,11 +4034,548 @@ def self_test():
     return result
 
 
+@dataclass
+class RunBundle:
+    result: Result
+    candidates: list = field(default_factory=list)
+    report: list = field(default_factory=list)
+    config: dict = field(default_factory=dict)
+
+
+def clone_result(result):
+    # Wells are immutable input snapshots. Avoid copying full LAS data once per
+    # ensemble result, and keep snapshot identity when projects are saved.
+    clone=copy.deepcopy(result,{id(result.ref):result.ref,id(result.target):result.target})
+    return clone
+
+
+def auto_intervals(ref, target, markers, params, ref_margin=10., target_margin=100., shift=0.):
+    """Only reference markers determine interval selection; never target labels."""
+    if not markers:
+        raise ValueError('Для автоматических интервалов нужны маркеры опорной скважины.')
+    if not all(np.isfinite(v) for v in (ref_margin, target_margin, shift)) or min(ref_margin, target_margin) < 0:
+        raise ValueError('Запасы должны быть конечными неотрицательными числами.')
+    low, high = min(m.md for m in markers), max(m.md for m in markers)
+    rs, re = max(float(ref.depth[0]), low-ref_margin), min(float(ref.depth[-1]), high+ref_margin)
+    ts, te = max(float(target.depth[0]), low+shift-target_margin), min(float(target.depth[-1]), high+shift+target_margin)
+    if rs >= re or ts >= te:
+        raise ValueError('Интервал по маркерам не пересекается с LAS. Проверьте смещение целевой скважины.')
+    return replace(params, ref_start=rs, ref_end=re, target_start=ts, target_end=te)
+
+
+def candidate_settings(base, curves, count=16, seed=42):
+    """Reproducible finite search. Vary shape parameters, never target labels.
+
+    Keep normalisation/intervals fixed to preserve user interpretation. Include
+    full-channel runs and leave-one-channel-out checks. No duplicate settings.
+    """
+    if not 2 <= count <= 64:
+        raise ValueError('Число генераций должно быть от 2 до 64.')
+    if not curves:
+        raise ValueError('Не выбраны кривые.')
+    curve_sets = [tuple(curves)]
+    if len(curves) > 1:
+        curve_sets += [tuple(c for c in curves if c != excluded) for excluded in curves]
+    choices = list(itertools.product((.5, 1., 1.5), (.75, 1., 1.25),
+                                    sorted({0, 1, 2, base.k}),
+                                    sorted({0., .025, .075, .15, base.penalty}), curve_sets))
+    rng = np.random.default_rng(seed)
+    rng.shuffle(choices)
+    result = [(replace(base), list(curves))]
+    seen = {(base.band, base.step, base.k, base.penalty, tuple(curves))}
+    for band, step, k, penalty, channels in choices:
+        p = replace(base, band=base.band*band, step=base.step*step, k=k, penalty=penalty)
+        key = (p.band, p.step, p.k, p.penalty, channels)
+        if key in seen:
+            continue
+        result.append((p, list(channels)))
+        seen.add(key)
+        if len(result) == count:
+            break
+    return result
+
+
+def _quality(result):
+    """Heuristic diagnostic, not probability. Never uses actual/error columns."""
+    support = float(result.stats['Доля пути с данными'])
+    coverage = result.stats.get('Покрытие маркеров')
+    coverage = 1. if coverage is None else float(coverage)
+    profile = np.diff(result.mapped) / np.diff(result.zr)
+    expected = (result.zt[-1]-result.zt[0])/(result.zr[-1]-result.zr[0])
+    deformation = float(np.mean((profile < expected*.2) | (profile > expected*5)))
+    center = result.zt[0] + (result.zr-result.zr[0])*expected
+    boundary = float(np.mean(abs(result.mapped-center) >= result.params.band*.9))
+    similarity = float(np.nanmean(result.similarity))
+    score = .40*similarity + .30*support + .30*coverage - .15*deformation - .10*boundary
+    return dict(quality=score, similarity=similarity, support=support, coverage=coverage,
+                deformation=deformation, boundary=boundary)
+
+
+def build_consensus(candidates, report, tolerance, requested):
+    """Cluster entire depth mappings; choose a real medoid, never splice tops.
+
+    Complete-link clusters prevent chaining disparate modes through intermediate
+    solutions. RMS depth distance is measured on reference marker positions plus
+    a sparse background grid. Display spread per marker within the selected mode.
+    """
+    if not candidates:
+        raise ValueError('Ни одна генерация не завершилась. Проверьте интервалы и данные.')
+    if tolerance <= 0 or not np.isfinite(tolerance):
+        raise ValueError('Допуск консенсуса должен быть положительным.')
+    first = candidates[0]
+    landmarks = [m.md for m in first.reference_markers if first.zr[0] <= m.md <= first.zr[-1]]
+    sample = np.unique(np.r_[np.linspace(first.zr[0], first.zr[-1], 17), landmarks])
+    vectors = np.array([np.interp(sample, r.zr, r.mapped) for r in candidates])
+    distances = np.sqrt(np.mean((vectors[:, None, :]-vectors[None, :, :])**2, axis=2))
+    qualities = [_quality(r) for r in candidates]
+    clusters = []
+    for index in sorted(range(len(candidates)), key=lambda i: -qualities[i]['quality']):
+        fitting = [g for g in clusters if all(distances[index,j] <= tolerance for j in g)]
+        if fitting:
+            min(fitting, key=lambda g: np.mean(distances[index,g])).append(index)
+        else:
+            clusters.append([index])
+    clusters.sort(key=lambda g: (-len(g), -np.mean([qualities[i]['quality'] for i in g])))
+    dominant = clusters[0]
+    chosen = min(dominant, key=lambda i: (float(np.mean(distances[i, dominant])), -qualities[i]['quality']))
+    result = clone_result(candidates[chosen])
+    credible_competition = len(clusters)>1 and len(clusters[1]) >= max(2, .5*len(dominant))
+    by_name = [{_key(row['marker']):row for row in r.rows} for r in candidates]
+    for row in result.rows:
+        name = _key(row['marker'])
+        values = [by_name[i][name]['predicted_md'] for i in dominant
+                  if name in by_name[i] and by_name[i][name]['predicted_md'] is not None]
+        row['support'] = len(values)/requested
+        row['p10'], row['p90'] = (map(float,np.percentile(values,[10,90])) if values else (None,None))
+        row['alternatives'] = []
+        for group in clusters[1:]:
+            alt = [by_name[i][name]['predicted_md'] for i in group
+                   if name in by_name[i] and by_name[i][name]['predicted_md'] is not None]
+            if alt:
+                row['alternatives'].append({'md':float(np.median(alt)), 'votes':len(alt), 'total':requested})
+        reasons = []
+        if row['predicted_md'] is not None:
+            if len(values)<3:
+                reasons.append('мало реализаций')
+            if row['support'] < .6:
+                reasons.append('слабая поддержка генераций')
+            if values and row['p90']-row['p10'] > 2*tolerance:
+                reasons.append('широкий диапазон')
+            if credible_competition:
+                reasons.append('конкурирующее решение')
+            if reasons:
+                row['status'] = 'Проверить: ' + '; '.join(reasons)
+        row['confirmed'] = False
+    for idx, quality in enumerate(qualities):
+        generation = candidates[idx].provenance['generation']
+        item = next(item for item in report if item['generation']==generation)
+        item.update(quality)
+        item['cluster'] = next(k+1 for k,g in enumerate(clusters) if idx in g)
+        item['selected'] = idx == chosen
+    result.provenance.update(mode='consensus', selected_generation=candidates[chosen].provenance['generation'],
+                             requested=requested, successful=len(candidates), tolerance=tolerance)
+    result.stats.update({'Генераций успешно / запрошено': f'{len(candidates)} / {requested}',
+                         'Групп решений':len(clusters), 'Поддержка группы консенсуса':len(dominant)/requested,
+                         'Выбранная генерация':candidates[chosen].provenance['generation'],
+                         'Диапазон P10–P90':'Чувствительность внутри выбранной группы; не доверительный интервал'})
+    return result
+
+
+def run_ensemble(ref, target, curves, params, rm, tm, count=16, seed=42,
+                 tolerance=2., cancel=None, progress=None, tuning=False):
+    cancel = cancel or threading.Event()
+    progress = progress or (lambda f,s:None)
+    options = candidate_settings(params, curves, count, seed)
+    if tuning:
+        rnames = {_key(m.name) for m in rm if (params.ref_start if params.ref_start is not None else ref.depth[0]) <= m.md <=
+                  (params.ref_end if params.ref_end is not None else ref.depth[-1])}
+        controls = { _key(m.name):m for m in tm if _key(m.name) in rnames and
+                    (params.target_start if params.target_start is not None else target.depth[0]) <= m.md <=
+                    (params.target_end if params.target_end is not None else target.depth[-1]) }
+        if len(controls) < 2:
+            raise ValueError('Для подбора нужны минимум два общих контрольных маркера внутри интервалов.')
+    candidates, report = [], []
+    for idx, (p, channels) in enumerate(options):
+        if cancel.is_set():
+            raise Cancelled('Расчёт отменён.')
+        item = dict(generation=idx+1, params=asdict(p), curves=channels, selected=False)
+        try:
+            result = correlate(ref,target,channels,p,rm,tm,cancel,
+                               lambda f,s:progress((idx+f)/len(options),f'Генерация {idx+1}/{len(options)}: {s}'))
+            result.provenance = dict(generation=idx+1,mode='candidate',seed=seed)
+            item.update(_quality(result), status='OK')
+            if tuning:
+                errors = { _key(row['marker']):abs(row['error']) for row in result.rows
+                           if row['error'] is not None and _key(row['marker']) in controls }
+                missing_penalty = (result.zt[-1]-result.zt[0]) + tolerance
+                loss = np.mean([errors.get(name,missing_penalty) for name in controls])
+                item.update(loss=float(loss), control_count=len(controls), checked=len(errors),
+                            control_coverage=len(errors)/len(controls),
+                            mae=float(np.mean(list(errors.values()))) if errors else None,
+                            within_tolerance=sum(e<=tolerance for e in errors.values())/len(controls))
+            candidates.append(result)
+        except Cancelled:
+            raise
+        except ValueError as error:
+            item.update(status=str(error),quality=None)
+        report.append(item)
+    if not candidates:
+        raise ValueError('Все генерации отклонены: ' + '; '.join(item['status'] for item in report[:3]))
+    if tuning:
+        successful = [x for x in report if x['status']=='OK' and x['checked']>=2]
+        if not successful:
+            raise ValueError('Ни один вариант не предсказал хотя бы два контрольных маркера. Подбор ненадёжен: проверьте покрытие.')
+        best = min(successful, key=lambda x:(x['loss'], -x['control_coverage'], -x['quality']))
+        best['selected'] = True
+        result = clone_result(next(r for r in candidates if r.provenance['generation']==best['generation']))
+        result.provenance.update(mode='tuned',control_names=sorted(controls),search_count=len(options))
+        result.stats.update({'Режим оценки':'Подбор на этих контрольных маркерах; НЕ независимая проверка',
+                             'Потеря со штрафом за пропуски, м':best['loss'],
+                             'Покрытие контрольных маркеров':best['control_coverage'],
+                             'Доля ошибок в допуске':best['within_tolerance'],
+                             'Выбрана генерация':best['generation']})
+    else:
+        result = build_consensus(candidates, report, tolerance, len(options))
+    return RunBundle(result,candidates,report,dict(ensemble=True,count=count,seed=seed,tolerance=tolerance,tuning=tuning))
+
+
+def output_markers(result):
+    return [Marker(row['marker'], result.target.name,result.target.uwi,float(row['predicted_md']))
+            for row in result.rows if row['predicted_md'] is not None]
+
+
+def run_sequence(wells, groups_by_path, curves, params, config, cancel=None, progress=None, initial_markers=None, manual_picks=None):
+    cancel = cancel or threading.Event()
+    progress = progress or (lambda f,s:None)
+    if len(wells)<2 or len({w.path for w in wells})!=len(wells):
+        raise ValueError('Нужны минимум две разные скважины в наборе.')
+    rm = list(initial_markers if initial_markers is not None else groups_by_path.get(wells[0].path,[]))
+    if not rm:
+        raise ValueError('У первой скважины набора нет опорных маркеров.')
+    bundles, errors, inherited = [], [], set()
+    for idx,(ref,target) in enumerate(zip(wells,wells[1:])):
+        if cancel.is_set():
+            raise Cancelled('Расчёт отменён.')
+        channels = [c for c in curves if c in ref.curves and c in target.curves]
+        try:
+            if not channels:
+                raise ValueError('Нет выбранных общих кривых.')
+            p = auto_intervals(ref,target,rm,params,config['ref_margin'],config['target_margin'],config['shift']) if config['auto'] else replace(params)
+            tm = groups_by_path.get(target.path,[])
+            cb = lambda f,s:progress((idx+f)/(len(wells)-1),f'{ref.name} → {target.name}: {s}')
+            if config['ensemble']:
+                bundle = run_ensemble(ref,target,channels,p,rm,tm,config['count'],config['seed'],config['tolerance'],cancel,cb)
+            else:
+                bundle = RunBundle(correlate(ref,target,channels,p,rm,tm,cancel,cb))
+            bundle.config.update(config)
+            bundle.config['requested_curves']=list(curves)
+            bundle.config['base_params']=asdict(params)
+            reapply_manual(bundle.result,(manual_picks or {}).get(target.path,{}))
+            for row in bundle.result.rows:
+                if _key(row['marker']) in inherited:
+                    row['status'] += '; проверить: неопределённость предыдущего переноса'
+                    row['inherited_uncertainty'] = True
+            bundles.append(bundle)
+            inherited |= {_key(row['marker']) for row in bundle.result.rows
+                          if 'провер' in row['status'].lower() and row['predicted_md'] is not None}
+            rm = output_markers(bundle.result)
+            if not rm and idx<len(wells)-2:
+                raise ValueError('Нет перенесённых маркеров для следующей пары.')
+        except ValueError as error:
+            errors.append(f'{ref.name} → {target.name}: {error}')
+            break
+    return bundles, errors
+
+
+def edit_marker(result, name, md, comment='', validate_order=True):
+    """Manual pick overrides exported tops, not the fitted log-to-log path."""
+    if not np.isfinite(md) or not result.zt[0]<=md<=result.zt[-1]:
+        raise ValueError('MD должна лежать внутри целевого расчётного интервала.')
+    row = next((r for r in result.rows if r['marker']==name),None)
+    if row is None:
+        raise ValueError('Маркер не найден.')
+    for other in result.rows if validate_order else []:
+        if other is row or other['predicted_md'] is None:
+            continue
+        if ((other['ref_md']<row['ref_md'] and other['predicted_md']>=md) or
+            (other['ref_md']>row['ref_md'] and other['predicted_md']<=md)):
+            raise ValueError('Исправление нарушает порядок маркеров. Проверьте соседние границы.')
+    row.setdefault('original_md',row['predicted_md'])
+    row.setdefault('history',[]).append(dict(previous_md=row['predicted_md'],new_md=float(md),
+                                          comment=comment,time=time.strftime('%Y-%m-%d %H:%M:%S')))
+    row.update(predicted_md=float(md),confirmed=True,status='Подтверждён пользователем',
+               error=float(md-row['actual_md']) if row['actual_md'] is not None else None,
+               semblance=None)
+    refresh_marker_stats(result)
+
+
+def refresh_marker_stats(result):
+    # Do not report manually corrected rows as successful automatic predictions.
+    errors = [r['error'] for r in result.rows if r.get('error') is not None and not r.get('confirmed')]
+    control_count=result.stats.get('Контрольных маркеров в целевом интервале',0)
+    predicted=sum(r['predicted_md'] is not None and result.zr[0]<=r['ref_md']<=result.zr[-1] for r in result.rows)
+    eligible=result.stats.get('Маркеров в опорном интервале',0)
+    result.stats.update({'MAE маркеров, м':float(np.mean(np.abs(errors))) if errors else None,
+                         'RMSE маркеров, м':float(np.sqrt(np.mean(np.square(errors)))) if errors else None,
+                         'Смещение прогноза, м':float(np.mean(errors)) if errors else None,
+                         'Макс. ошибка маркера, м':float(np.max(np.abs(errors))) if errors else None,
+                         'Проверено маркеров':len(errors),
+                         'Доля проверенных целевых маркеров':len(errors)/control_count if control_count else None,
+                         'Перенесено маркеров':predicted,
+                         'Покрытие маркеров':predicted/eligible if eligible else None,
+                         'Подтверждено пользователем':sum(bool(r.get('confirmed')) for r in result.rows)})
+
+
+def reapply_manual(result, picks):
+    """Keep user picks across recalculation; never silently replace them."""
+    proposed={_key(row['marker']):picks.get(_key(row['marker']),row).get('predicted_md') for row in result.rows}
+    for row in result.rows:
+        saved=picks.get(_key(row['marker']))
+        if not saved:
+            continue
+        try:
+            md=saved['predicted_md']
+            for other in result.rows:
+                other_md=proposed[_key(other['marker'])]
+                if other is row or other_md is None:
+                    continue
+                if ((other['ref_md']<row['ref_md'] and other_md>=md) or
+                    (other['ref_md']>row['ref_md'] and other_md<=md)):
+                    raise ValueError('Подтверждённая глубина конфликтует с порядком других границ.')
+            edit_marker(result,row['marker'],md,'Повторное применение подтверждённой границы',validate_order=False)
+            row['history']=copy.deepcopy(saved.get('history',[]))
+            row['original_md']=saved.get('original_md')
+        except ValueError as error:
+            row.update(predicted_md=None,error=None,status='Проверить ручную границу: '+str(error))
+            row['history']=copy.deepcopy(saved.get('history',[]))
+            row['saved_manual_md']=saved['predicted_md']
+    if picks:
+        refresh_marker_stats(result)
+
+
+def marker_color(name):
+    hue = int(hashlib.sha256(_key(name).encode('utf-8')).hexdigest()[:8],16)/0xffffffff
+    rgb = colorsys.hsv_to_rgb(hue,.75,.68)
+    return '#'+''.join(f'{round(c*255):02x}' for c in rgb)
+
+
+def flag_reused_calibration(bundles, contexts):
+    for bundle in bundles:
+        context=contexts.get(bundle.result.target.path)
+        if context:
+            bundle.result.provenance['calibrated_on_target']=copy.deepcopy(context)
+            bundle.result.stats['Режим оценки']='Параметры ранее подбирались по этой целевой скважине; НЕ независимая проверка'
+
+
+def _json_clean(value):
+    if isinstance(value, dict):
+        return {str(k):_json_clean(v) for k,v in value.items()}
+    if isinstance(value,(list,tuple)):
+        return [_json_clean(v) for v in value]
+    if isinstance(value,np.generic):
+        value = value.item()
+    if isinstance(value,float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def save_project(path, wells, markers, bundles, ui):
+    """Atomic self-contained zip/JSON/NumPy snapshot; no pickle, no sidecars."""
+    from io import BytesIO
+    path = Path(path)
+    fd, temporary_name = tempfile.mkstemp(prefix=path.name+'.',suffix='.tmp',dir=path.parent)
+    os.close(fd)
+    temporary = Path(temporary_name)
+    snapshots=list(wells)
+    well_ids = {id(well):str(i) for i,well in enumerate(snapshots)}
+    active=[well_ids[id(well)] for well in wells]
+    for bundle in bundles:
+        for result in [bundle.result]+bundle.candidates:
+            for well in (result.ref,result.target):
+                if id(well) not in well_ids:
+                    well_ids[id(well)]=str(len(snapshots))
+                    snapshots.append(well)
+    manifest = dict(format='idtw-project',version=2,wells=[],active_well_ids=active,markers=[asdict(m) for m in markers],bundles=[],ui=ui)
+    try:
+        with zipfile.ZipFile(temporary,'w',compression=zipfile.ZIP_DEFLATED) as archive:
+            counter = itertools.count()
+            total_bytes=0
+            def array(value):
+                nonlocal total_bytes
+                name = f'arrays/{next(counter)}.npy'
+                stream = BytesIO()
+                np.save(stream,value,allow_pickle=False)
+                total_bytes+=stream.tell()
+                if total_bytes>500*1024*1024:
+                    raise ValueError('Проект превышает 500 МБ массивов. Уменьшите число генераций или скважин.')
+                archive.writestr(name,stream.getvalue())
+                return name
+            def encode_result(r):
+                return dict(ref=well_ids[id(r.ref)],target=well_ids[id(r.target)],curves=r.curves,params=asdict(r.params),
+                            arrays={k:array(getattr(r,k)) for k in ('zr','zt','xr','xt','path','mapped','similarity')},
+                            rows=r.rows,stats=r.stats,notes=r.notes,reference_markers=[asdict(m) for m in r.reference_markers],
+                            control_markers=[asdict(m) for m in r.control_markers],provenance=r.provenance)
+            for well in snapshots:
+                manifest['wells'].append(dict(id=well_ids[id(well)],path=well.path,name=well.name,uwi=well.uwi,
+                                             depth=array(well.depth),curves={c:array(v) for c,v in well.curves.items()},
+                                             units=well.units,notes=well.notes))
+            for bundle in bundles:
+                manifest['bundles'].append(dict(result=encode_result(bundle.result),
+                                               candidates=[encode_result(r) for r in bundle.candidates],
+                                               report=bundle.report,config=bundle.config))
+            archive.writestr('project.json',json.dumps(_json_clean(manifest),ensure_ascii=False,allow_nan=False))
+        os.replace(temporary,path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def load_project(path):
+    from io import BytesIO
+    with zipfile.ZipFile(path) as archive:
+        if sum(i.file_size for i in archive.infolist())>512*1024*1024:
+            raise ValueError('Распакованный проект превышает 512 МБ.')
+        doc = json.loads(archive.read('project.json'))
+        if doc.get('format')!='idtw-project' or doc.get('version')!=2:
+            raise ValueError('Неизвестный формат или версия проекта.')
+        def array(name):
+            value = np.load(BytesIO(archive.read(name)),allow_pickle=False)
+            if value.dtype.kind not in 'fiu' or value.ndim>2:
+                raise ValueError('Неверный массив в проекте.')
+            return value
+        wells, lookup = [], {}
+        for spec in doc['wells']:
+            well = Well(spec['path'],spec['name'],spec['uwi'],array(spec['depth']),
+                        {c:array(v) for c,v in spec['curves'].items()},spec['units'],spec['notes'])
+            if well.depth.ndim!=1 or len(well.depth)<8 or not np.all(np.isfinite(well.depth)) or np.any(np.diff(well.depth)<=0):
+                raise ValueError('Некорректная глубина в проекте.')
+            if any(v.shape!=well.depth.shape for v in well.curves.values()):
+                raise ValueError('Размеры кривых не совпадают с глубиной.')
+            lookup[spec['id']] = well
+            wells.append(well)
+        def decode_result(spec):
+            a = {k:array(v) for k,v in spec['arrays'].items()}
+            if a['mapped'].shape != a['zr'].shape or a['similarity'].shape!=a['zr'].shape:
+                raise ValueError('Повреждённое соответствие глубин в проекте.')
+            return Result(lookup[spec['ref']],lookup[spec['target']],spec['curves'],Params(**spec['params']),
+                          **a,rows=spec['rows'],stats=spec['stats'],notes=spec['notes'],
+                          reference_markers=[Marker(**m) for m in spec['reference_markers']],
+                          control_markers=[Marker(**m) for m in spec['control_markers']],provenance=spec['provenance'])
+        bundles = [RunBundle(decode_result(b['result']),[decode_result(r) for r in b['candidates']],b['report'],b['config'])
+                   for b in doc['bundles']]
+        if 'active_well_ids' in doc:
+            wells=[lookup[key] for key in doc['active_well_ids']]
+        return wells,[Marker(**m) for m in doc['markers']],bundles,doc['ui']
+
+
+def advanced_self_test():
+    ref,target,rm,tm=_synthetic_case()
+    base=Params(step=.5,band=15,penalty=.025)
+    checks=[]
+    def check(condition,name):
+        if not condition:
+            raise AssertionError(name)
+        checks.append(name)
+    auto=auto_intervals(ref,target,rm,base,2,8,20)
+    check((auto.ref_start,auto.ref_end,auto.target_start,auto.target_end)==(7.,94.,21.,120.),'auto intervals, margins, shift and clipping')
+    options=candidate_settings(base,['GR'],8,123)
+    check([(asdict(p),c) for p,c in options]==[(asdict(p),c) for p,c in candidate_settings(base,['GR'],8,123)],'reproducible parameter search')
+    check(len({json.dumps(asdict(p),sort_keys=True)+str(c) for p,c in options})==8,'unique candidate settings')
+    ensemble=run_ensemble(ref,target,['GR'],base,rm,tm,count=6,seed=3,tolerance=2)
+    check(len(ensemble.candidates)==6 and any(item.get('selected') for item in ensemble.report),'ensemble candidates and selected medoid')
+    check(any(np.array_equal(ensemble.result.path,r.path) for r in ensemble.candidates),'consensus is a real coherent path')
+    check(all(row.get('p10')<=row['p90'] for row in ensemble.result.rows if row.get('p10') is not None),'uncertainty bounds')
+    independent=run_ensemble(ref,target,['GR'],base,rm,[],count=6,seed=3,tolerance=2)
+    check(ensemble.result.provenance['selected_generation']==independent.result.provenance['selected_generation'] and
+          np.array_equal(ensemble.result.path,independent.result.path),'consensus selection does not use control labels')
+    tuned=run_ensemble(ref,target,['GR'],base,rm,tm,count=6,seed=3,tolerance=2,tuning=True)
+    winner=next(item for item in tuned.report if item.get('selected'))
+    check(winner['loss']==min(item['loss'] for item in tuned.report if item['status']=='OK'),'tuning minimises declared loss')
+    check(tuned.result.provenance['mode']=='tuned' and 'НЕ независимая' in tuned.result.stats['Режим оценки'],'tuning provenance is explicit')
+    # Distinct modes must remain alternatives, not be averaged into a false pick.
+    modes=[]
+    report=[]
+    for i in range(5):
+        r=copy.deepcopy(ensemble.candidates[0])
+        r.provenance['generation']=i+1
+        if i>=3:
+            r.mapped=r.mapped+8
+            for row in r.rows:
+                if row['predicted_md'] is not None:
+                    row['predicted_md']+=8
+        modes.append(r)
+        report.append(dict(generation=i+1,status='OK'))
+    voted=build_consensus(modes,report,2,7)
+    check(voted.stats['Групп решений']==2 and bool(voted.rows[0]['alternatives']),'competing modes retained')
+    check(abs(voted.rows[0]['support']-3/7)<1e-9,'failed generations remain in support denominator')
+    edited=copy.deepcopy(ensemble.result)
+    original=edited.rows[0]['predicted_md']
+    edit_marker(edited,edited.rows[0]['marker'],original+.2,'test interpretation')
+    check(edited.rows[0]['confirmed'] and edited.rows[0]['original_md']==original and len(edited.rows[0]['history'])==1,'manual pick history and provenance')
+    check(edited.stats['Проверено маркеров']==5,'manual corrections excluded from automatic validation')
+    try:
+        edit_marker(edited,edited.rows[0]['marker'],edited.rows[1]['predicted_md']+1)
+    except ValueError:
+        checks.append('manual crossing rejected')
+    else:
+        raise AssertionError('manual crossing accepted')
+    third=Well('synthetic_third.las','Синтетическая В','0003',target.depth+15,
+               {'GR':target.curves['GR'].copy()},target.units.copy())
+    controls3=[Marker(m.name,third.name,third.uwi,m.md+15) for m in tm]
+    config=dict(auto=False,ensemble=False,count=4,seed=42,tolerance=2,ref_margin=10,target_margin=100,shift=0)
+    bundles,errors=run_sequence([ref,target,third],{ref.path:rm,target.path:tm,third.path:controls3},['GR'],base,config)
+    check(len(bundles)==2 and not errors,'three-well sequence')
+    check(np.allclose([m.md for m in bundles[1].result.reference_markers],
+                      [r['predicted_md'] for r in bundles[0].result.rows]),'sequence propagates predictions, not target control labels')
+    edit_marker(bundles[0].result,bundles[0].result.rows[0]['marker'],bundles[0].result.rows[0]['predicted_md']+.3)
+    repeated,errors=run_sequence([target,third],{third.path:controls3},['GR'],base,config,
+                                 initial_markers=output_markers(bundles[0].result))
+    check(abs(repeated[0].result.reference_markers[0].md-bundles[0].result.rows[0]['predicted_md'])<1e-12,'downstream recalculation uses edited picks')
+    with tempfile.TemporaryDirectory(prefix='idtw_project_check_') as directory:
+        path=Path(directory)/'roundtrip.idtw'
+        ensemble.result=edited
+        save_project(path,[ref,target,third],rm+tm+controls3,[ensemble,tuned]+bundles,{'sequence':[ref.path,target.path,third.path]})
+        ws,ms,bs,ui=load_project(path)
+        check(len(ws)==3 and len(ms)==18 and len(bs)==4 and len(bs[0].candidates)==6,'self-contained project round trip')
+        check(bs[0].result.rows[0]['history']==edited.rows[0]['history'] and
+              np.array_equal(bs[0].result.path,edited.path) and ui['sequence'][2]==third.path,'project preserves edits, paths and order')
+        check(np.allclose(ws[0].curves['GR'],ref.curves['GR']),'project restores data without source files')
+        changed=Well(ref.path,ref.name,ref.uwi,ref.depth.copy(),{'GR':ref.curves['GR']+100},ref.units.copy())
+        save_project(path,[changed,target],rm+tm,[ensemble],{})
+        ws,ms,bs,ui=load_project(path)
+        check(np.allclose(ws[0].curves['GR'],ref.curves['GR']+100) and
+              np.allclose(bs[0].result.ref.curves['GR'],ref.curves['GR']),
+              'project preserves old result snapshots after reloading the same LAS path')
+    restored=clone_result(ensemble.candidates[0])
+    picks={_key(edited.rows[0]['marker']):edited.rows[0]}
+    reapply_manual(restored,picks)
+    check(restored.rows[0]['confirmed'] and restored.rows[0]['history']==edited.rows[0]['history'],
+          'manual pick survives recalculation without rewriting its history')
+    event=threading.Event()
+    event.set()
+    try:
+        run_ensemble(ref,target,['GR'],base,rm,tm,count=4,cancel=event)
+    except Cancelled:
+        checks.append('ensemble cancellation')
+    else:
+        raise AssertionError('ensemble cancellation ignored')
+    try:
+        run_ensemble(ref,target,['GR'],base,rm,tm[:1],count=4,tuning=True)
+    except ValueError:
+        checks.append('insufficient calibration controls rejected')
+    else:
+        raise AssertionError('single-control tuning accepted')
+    print(f'PASS: {len(checks)} advanced checks.')
+    for name in checks:
+        print('  OK:',name)
+    return len(checks)
+
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 
-class IDTWApp(tk.Tk):
+class PairApp(tk.Tk):
     """Tk is used only by the main thread; workers communicate via a queue."""
 
     def __init__(self):
@@ -4049,7 +4599,7 @@ class IDTWApp(tk.Tk):
         self._plot = None
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._close)
-        self.after(100, self._poll)
+        self._poll_id=self.after(100, self._poll)
         self._refresh_buttons()
 
     def _control(self, widget, normal="normal"):
@@ -4106,8 +4656,8 @@ class IDTWApp(tk.Tk):
         scroll.pack(side="right", fill="y")
         self.curve_list.configure(yscrollcommand=scroll.set)
         self.curve_list.bind("<<ListboxSelect>>", self._input_changed)
-        parameters = ttk.LabelFrame(settings, text="Параметры IDTW", padding=5)
-        parameters.pack(side="left", fill="both", expand=True)
+        parameters = ttk.LabelFrame(self.settings_dialog, text="Параметры IDTW", padding=10)
+        parameters.pack(fill="x", padx=10, pady=5)
         self.vars = {}
         fields = [("step", "Шаг, м", "0.5"), ("band", "Полоса, м", "50"),
                   ("max_points", "Макс. отсчётов", "2000"), ("gap", "Интерп. разрыв, м", "3"),
@@ -4159,10 +4709,10 @@ class IDTWApp(tk.Tk):
         self.display_box.pack(side="left", padx=5)
         self.display_box.bind("<<ComboboxSelected>>", lambda event: self._draw())
         ttk.Button(plot_toolbar, text="Сброс масштаба", command=self._reset_view).pack(side="left", padx=5)
-        ttk.Label(plot_toolbar, text="Колесо: масштаб · Перетаскивание: глубина · Наведение: соответствие").pack(side="right", padx=4)
+        ttk.Label(plot_toolbar, text="Колесо: глубина · Shift + колесо: масштаб · Наведение: соответствие").pack(side="right", padx=4)
         self.canvas = tk.Canvas(compare, background="#fafbfd", highlightthickness=1, highlightbackground="#d9e0e8")
         self.canvas.pack(fill="both", expand=True, pady=5)
-        self.hover = tk.StringVar(value="Синие линии — каротаж; оранжевые — перенос; зелёные отметки — известные маркеры целевой.")
+        self.hover = tk.StringVar(value="Цвет закреплён за маркером; пунктир — прогноз, сплошная отметка — известная граница.")
         ttk.Label(compare, textvariable=self.hover).pack(fill="x")
         self.canvas.bind("<Configure>", lambda event: self._draw())
         self.canvas.bind("<MouseWheel>", self._zoom)
@@ -4204,6 +4754,10 @@ class IDTWApp(tk.Tk):
 2. Выберите опорную и целевую скважины, затем общие кривые (Ctrl/Shift для нескольких).
 3. Проверьте привязку групп маркеров. Пустая привязка означает отсутствие маркеров. Идентификация по UWI/имени может требовать ручного исправления.
 4. При необходимости задайте сопоставимые интервалы MD. Пустая граница берётся из диапазона LAS. Нажмите «Рассчитать корреляцию».
+5. Кнопка «Интервалы по маркерам» заполняет MD по диапазону опорных маркеров: запас 10 м для опорной и 100 м для целевой. Запасы и смещение изменяются в отдельном окне «Настройки».
+6. Вкладка «Последовательный набор»: добавьте скважины в список, задайте порядок перетаскиванием и проверьте группы маркеров. Для каждой пары можно автоматически определять интервалы. Неопределённые переносы помечаются при распространении дальше.
+7. «Открыть результат отдельно»: общий профиль набора, выбор пары и генерации, диапазоны чувствительности, таблица и история ручных правок. Исправление применяется к маркеру; сам путь каротажа не превращается в жёстко привязанный к нему путь.
+8. Сохраняйте проект через меню «Проект»: файл .idtw содержит снимок данных, настройки, порядок, генерации и историю. Для восстановления исходные LAS/Excel не требуются.
 
 АЛГОРИТМ И ОГРАНИЧЕНИЯ
 Используется локальная ошибка 1 − semblance с преобразованием Гильберта и поиск пути динамическим программированием. Несколько выбранных кривых имеют равные веса. K — полуокно semblance в отсчётах сетки. Semblance является мерой сходства, а не вероятностью правильной корреляции.
@@ -4214,12 +4768,15 @@ DTW фиксирует концы выбранных интервалов: эт�
 
 МАРКЕРЫ И ПРОВЕРКА
 Обязательные заголовки markers.xlsx: Маркер, Скважина, UWI, MD, X, Y, Z. MD задаётся в метрах. X/Y/Z сохраняются как метаданные; вертикальная ось сравнения — MD, а не абсолютная отметка Z.
-Маркеры опорной скважины переносятся по пути DTW. Известные маркеры целевой используются только для проверки и не задают путь корреляции. Ошибка — прогноз минус известная MD. MAE считается только по проверяемым переносам; покрытие нужно оценивать отдельно.
+Маркеры опорной скважины переносятся по пути DTW. В обычном и многовариантном режиме известные маркеры целевой используются только для проверки. Ошибка — прогноз минус известная MD. MAE считается только по проверяемым автоматическим переносам; ручные правки исключены. Покрытие нужно оценивать отдельно.
+В режиме «Подобрать настройки по разметке» проверяется набор комбинаций параметров. Выбирается минимальная средняя абсолютная ошибка со штрафом за каждый пропуск. Используются исходные и подтверждённые пользователем контрольные маркеры. Это подбор на известных ответах; его ошибка не является независимой проверкой и лучший вариант не является доказанным глобальным оптимумом. Примените выбранные параметры кнопкой в отдельном окне результата.
+Многовариантный режим выбирает реальный путь из наиболее поддержанной группы решений, а не усредняет разные границы. P10–P90 показывает чувствительность внутри этой группы; альтернативные группы отображаются отдельно. Поддержка не является вероятностью правильности. Провальные генерации учитываются в знаменателе поддержки.
+Ручную MD можно изменить и подтвердить двойным щелчком в таблице отдельного окна. История сохраняется. Последующие пары после такой правки устаревают; кнопка «Пересчитать после этой скважины» использует исправленные границы как исходные для переноса дальше. Подтверждённые правки сохраняются при пересчётах; конфликты отмечаются явно.
 Для неизвестного UWI выбирайте группу вручную. При отсутствии маркеров по-прежнему можно сравнить каротаж и путь корреляции.
 
 ГРАФИК
-Две дорожки показывают исходные значения выбранной кривой с отдельными шкалами амплитуды. Оранжевая линия связывает опорный маркер с прогнозом, зелёная отметка показывает известное положение в целевой. Серые тонкие линии показывают примеры соответствий пути.
-Наведение в дорожке показывает MD опорной, соответствующую MD целевой и локальный semblance. Колесо синхронно масштабирует относительные интервалы двух скважин, перетаскивание перемещает окно. Выбор строки маркера центрирует график на опорной глубине. Статистический результат от масштаба и выбранной отображаемой кривой не меняется.
+Дорожки показывают исходные значения выбранной кривой с отдельными шкалами амплитуды. Одинаковое имя маркера имеет одинаковый цвет. В основном окне пунктир — прогноз, сплошная отметка — контроль; серые линии показывают примеры соответствий пути. В отдельном окне точка означает контроль, ромб — ручное подтверждение; сомнительные линии пунктирные, цветные зоны — P10–P90.
+Наведение показывает соответствие глубин и показатели. Колесо перемещает глубину, Shift + колесо масштабирует около указателя, перетаскивание перемещает окно. Основной график использует относительные окна двух скважин, отдельное окно — общую шкалу MD для всего профиля. Масштаб не меняет результаты расчёта.
 
 Экспорт создаёт отдельный CSV с UTF-8 BOM для открытия в Excel. Исходные LAS и XLSX не изменяются.
 """)
@@ -4409,9 +4966,12 @@ DTW фиксирует концы выбранных интервалов: эт�
                     else:
                         self.result = payload
                         self._show_result()
+                elif kind in ("analysis", "project", "saved"):
+                    if not self.cancel_event.is_set():
+                        self._handle_extra(kind, payload)
         except queue.Empty:
             pass
-        self.after(80, self._poll)
+        self._poll_id=self.after(80, self._poll)
 
     def _update_files(self):
         marker_text = f"маркеров: {len(self.markers)} ({Path(self.marker_path).name})" if hasattr(self, "marker_path") else "маркеры не загружены"
@@ -4474,7 +5034,9 @@ DTW фиксирует концы выбранных интервалов: эт�
         details = [f"{key}: {self._fmt(value)}" for key, value in result.stats.items()]
         if not result.stats.get("Предупреждения"):
             details += list(result.notes)
-        details.append("Semblance — мера сходства, не вероятность. Целевые маркеры использованы только для проверки.")
+        details.append("Semblance — мера сходства, не вероятность. " +
+                       ("Целевые маркеры использованы для ПОДБОРА; ошибка не независимая."
+                        if result.provenance.get('mode')=='tuned' or result.provenance.get('calibrated_on_target') else "Целевые маркеры использованы только для проверки."))
         self._set_stats("\n".join(details))
         for item in self.table.get_children():
             self.table.delete(item)
@@ -4549,6 +5111,9 @@ DTW фиксирует концы выбранных интервалов: эт�
         span = self._u1 - self._u0
         anchor = self._u0 + relative * span
         direction = 1 if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0 else -1
+        if not getattr(event, 'state', 0) & 0x0001:
+            self._bounded_view(self._u0 - direction * span * .10, span)
+            return
         new_span = min(1.0, max(0.005, span * (0.8 if direction > 0 else 1.25)))
         self._bounded_view(anchor - relative * new_span, new_span)
 
@@ -4640,29 +5205,30 @@ DTW фиксирует концы выбранных интервалов: эт�
             if row.get("ref_md") is None:
                 continue
             yr = self._y(row["ref_md"])
+            color=marker_color(row['marker'])
             pred, actual = row.get("predicted_md"), row.get("actual_md")
             if top <= yr <= bottom:
-                c.create_line(left[0], yr, left[1], yr, fill="#c06a14", dash=(4, 3))
-                c.create_text(left[1] + 3, yr - 2, text=str(row["marker"])[:24], anchor="sw", fill="#9b4b08", font=("Segoe UI", 9))
+                c.create_line(left[0], yr, left[1], yr, fill=color, dash=(4, 3))
+                c.create_text(left[1] + 3, yr - 2, text=str(row["marker"])[:24], anchor="sw", fill=color, font=("Segoe UI", 9))
             if pred is not None and np.isfinite(pred):
                 yt = self._y(pred, True)
                 if top <= yt <= bottom:
-                    c.create_line(right[0], yt, right[1], yt, fill="#c06a14", dash=(4, 3))
+                    c.create_line(right[0], yt, right[1], yt, fill=color, dash=(4, 3))
                 if top <= yr <= bottom and top <= yt <= bottom:
-                    c.create_line(left[1], yr, right[0], yt, fill="#c06a14", width=1.8)
+                    c.create_line(left[1], yr, right[0], yt, fill=color, width=1.8)
             if actual is not None and np.isfinite(actual):
                 ya = self._y(actual, True)
                 if top <= ya <= bottom:
-                    c.create_line(right[0], ya, right[1], ya, fill="#138451", width=2)
-                    c.create_text(right[1] - 3, ya - 2, text=str(row["marker"])[:24], anchor="se", fill="#087443", font=("Segoe UI", 9))
+                    c.create_line(right[0], ya, right[1], ya, fill=color, width=2)
+                    c.create_text(right[1] - 3, ya - 2, text=str(row["marker"])[:24], anchor="se", fill=color, font=("Segoe UI", 9))
         shown = {_key(row['marker']) for row in result.rows if row.get('actual_md') is not None}
         for marker in self.groups.get(self.tgroup_var.get(), []):
             if _key(marker.name) in shown:
                 continue
             ya = self._y(marker.md, True)
             if top <= ya <= bottom:
-                c.create_line(right[0], ya, right[1], ya, fill="#138451", width=2)
-                c.create_text(right[1]-3, ya-2, text=marker.name[:24], anchor="se", fill="#087443", font=("Segoe UI", 9))
+                c.create_line(right[0], ya, right[1], ya, fill=marker_color(marker.name), width=2)
+                c.create_text(right[1]-3, ya-2, text=marker.name[:24], anchor="se", fill=marker_color(marker.name), font=("Segoe UI", 9))
 
     def _hover(self, event):
         if not self._plot or self._drag:
@@ -4709,7 +5275,815 @@ DTW фиксирует концы выбранных интервалов: эт�
     def _close(self):
         self.cancel_event.set()
         self._closing = True
+        if getattr(self,'_poll_id',None):
+            self.after_cancel(self._poll_id)
         self.destroy()
+
+
+class IDTWApp(PairApp):
+    """Application controller for pair, sequence, ensemble and project workflows."""
+    def __init__(self):
+        self.bundles = []
+        self.sequence_paths = []
+        self.result_windows = []
+        self.project_path = None
+        self.manual_picks = {}
+        self.calibration_context = {}
+        self.dirty = False
+        super().__init__()
+        self.title('IDTW — корреляция скважин и контроль вариантов')
+        self.geometry('1280x900')
+
+    def _build(self):
+        self.settings_dialog = tk.Toplevel(self)
+        self.settings_dialog.title('Настройки IDTW')
+        self.settings_dialog.geometry('1010x660')
+        self.settings_dialog.protocol('WM_DELETE_WINDOW',self.settings_dialog.withdraw)
+        self.settings_dialog.withdraw()
+        super()._build()
+        settings = ttk.LabelFrame(self.settings_dialog,text='Автоинтервалы и генерации',padding=10)
+        settings.pack(fill='x',padx=10,pady=5)
+        self.config_vars = {}
+        options = [('ref_margin','Запас опорной, м','10'),('target_margin','Запас целевой, м','100'),
+                   ('shift','Смещение целевой, м','0'),('count','Генераций (2–64)','16'),
+                   ('seed','Seed генераций','42'),('tolerance','Допуск согласия/ошибки, м','2')]
+        for i,(key,label,value) in enumerate(options):
+            self.config_vars[key] = tk.StringVar(value=value)
+            ttk.Label(settings,text=label).grid(row=i//2,column=(i%2)*2,sticky='w',padx=5,pady=4)
+            self._control(ttk.Entry(settings,textvariable=self.config_vars[key],width=16)).grid(row=i//2,column=(i%2)*2+1,padx=8)
+        self.config_vars['ensemble'] = tk.BooleanVar(value=False)
+        self.config_vars['auto'] = tk.BooleanVar(value=True)
+        self._control(ttk.Checkbutton(settings,text='Многовариантный расчёт (для пары и набора)',variable=self.config_vars['ensemble'])).grid(row=3,column=0,columnspan=4,sticky='w')
+        self._control(ttk.Checkbutton(settings,text='Автоинтервалы для каждой пары последовательного набора',variable=self.config_vars['auto'])).grid(row=4,column=0,columnspan=4,sticky='w')
+        for var in self.config_vars.values():
+            var.trace_add('write',self._input_changed)
+        explanation = ('Генератор проверяет полосу ×0.5/1/1.5, шаг ×0.75/1/1.25, K=0/1/2/заданный, '
+                       'штраф 0/0.025/0.075/0.15/заданный, набор кривых и исключение одного канала. '
+                       'Нормировка и интервалы фиксированы. Seed обеспечивает повторяемость.\n\n'
+                       'Консенсус: группировка целых путей по RMS расхождения глубин; выбирается реальный '
+                       'представитель наиболее поддержанной группы. P10–P90 — чувствительность внутри группы, '
+                       'не доверительный интервал. Альтернативы показываются отдельно.\n\n'
+                       'Подбор: средняя абсолютная ошибка по общим контрольным маркерам; за отсутствие прогноза '
+                       'штраф = длина целевого интервала + допуск. Это лучший из проверенных вариантов, '
+                       'не глобальный оптимум. Ошибки подбора не являются независимой оценкой точности.')
+        ttk.Label(self.settings_dialog,text=explanation,wraplength=955,justify='left').pack(fill='x',padx=15,pady=10)
+        self._control(ttk.Button(self.settings_dialog,text='Восстановить настройки',command=self._defaults)).pack(side='left',padx=15,pady=8)
+        ttk.Button(self.settings_dialog,text='Закрыть',command=self.settings_dialog.withdraw).pack(side='right',padx=15,pady=8)
+        # Add a compact toolbar; heavy settings remain in a separate window.
+        menu = tk.Menu(self)
+        project_menu = tk.Menu(menu,tearoff=False)
+        project_menu.add_command(label='Открыть проект…',command=self._open_project)
+        project_menu.add_command(label='Сохранить проект…',command=self._save_project)
+        menu.add_cascade(label='Проект',menu=project_menu)
+        menu.add_command(label='Настройки…',command=self._settings)
+        self.configure(menu=menu)
+        extra = ttk.Frame(self.notebook.master)
+        extra.pack(fill='x',before=self.notebook,pady=5)
+        self._control(ttk.Button(extra,text='Интервалы по маркерам',command=self._auto_depth)).pack(side='left',padx=3)
+        self._control(ttk.Button(extra,text='Настройки…',command=self._settings)).pack(side='left',padx=3)
+        self.tune_button = self._control(ttk.Button(extra,text='Подобрать настройки по разметке',command=lambda:self._run_mode('tune')))
+        self.tune_button.pack(side='left',padx=3)
+        self.window_button = ttk.Button(extra,text='Открыть результат отдельно',command=self._open_result)
+        self.window_button.pack(side='left',padx=3)
+        self._control(ttk.Button(extra,text='Сохранить проект…',command=self._save_project)).pack(side='right',padx=3)
+        seq = ttk.Frame(self.notebook,padding=10)
+        self.notebook.insert(1,seq,text='Последовательный набор')
+        ttk.Label(seq,text='Добавьте скважины в правый список. Перетаскивайте строки для изменения порядка А → Б → В.').pack(anchor='w')
+        lists = ttk.Frame(seq)
+        lists.pack(fill='both',expand=True,pady=8)
+        left = ttk.Frame(lists)
+        left.pack(side='left',fill='both',expand=True)
+        right = ttk.Frame(lists)
+        right.pack(side='right',fill='both',expand=True)
+        ttk.Label(left,text='Загруженные скважины').pack(anchor='w')
+        self.available_list = self._control(tk.Listbox(left,selectmode='extended',exportselection=False,height=7,width=45))
+        self.available_list.pack(fill='both',expand=True)
+        self._control(ttk.Button(left,text='Добавить выбранные →',command=self._sequence_add)).pack(anchor='e',pady=4)
+        ttk.Label(right,text='Порядок расчёта — перетащите строку').pack(anchor='w')
+        self.sequence_list = self._control(tk.Listbox(right,exportselection=False,height=7,width=52))
+        self.sequence_list.pack(fill='both',expand=True,padx=(12,0))
+        self.sequence_list.bind('<ButtonPress-1>',self._drag_sequence_start)
+        self.sequence_list.bind('<B1-Motion>',self._drag_sequence)
+        self.sequence_list.bind('<<ListboxSelect>>',self._sequence_selection)
+        self._control(ttk.Button(right,text='Удалить выбранную',command=self._sequence_remove)).pack(anchor='e',pady=4)
+        assignment = ttk.Frame(seq)
+        assignment.pack(fill='x',pady=4)
+        ttk.Label(assignment,text='Группа маркеров выбранной скважины:').pack(side='left')
+        self.sequence_group = tk.StringVar()
+        self.sequence_group_box = self._control(ttk.Combobox(assignment,textvariable=self.sequence_group,state='readonly',width=60),'readonly')
+        self.sequence_group_box.pack(side='left',padx=8)
+        self.sequence_group_box.bind('<<ComboboxSelected>>',self._assign_sequence_group)
+        self.sequence_button = self._control(ttk.Button(seq,text='Рассчитать последовательный набор',command=lambda:self._run_mode('sequence')))
+        self.sequence_button.pack(anchor='w',pady=6)
+        ttk.Label(seq,text='Исходные маркеры берутся из первой скважины. Затем используются перенесённые или вручную подтверждённые границы.\n'
+                  'Контрольные маркеры остальных скважин служат для оценки. Неопределённость предыдущих переносов отмечается в статусе.',wraplength=1100).pack(anchor='w')
+        self.sequence_status = ttk.Label(seq,text='')
+        self.sequence_status.pack(anchor='w',pady=5)
+
+    def _settings(self):
+        self.settings_dialog.deiconify()
+        self.settings_dialog.lift()
+
+    def _defaults(self):
+        self._guard=True
+        for key,value in asdict(Params()).items():
+            self.vars[key].set('' if value is None else str(value))
+        for key,value in dict(ref_margin='10',target_margin='100',shift='0',count='16',seed='42',tolerance='2',ensemble=False,auto=True).items():
+            self.config_vars[key].set(value)
+        self._guard=False
+        self._input_changed()
+
+    def _read_config(self):
+        result = {}
+        for key,var in self.config_vars.items():
+            value = var.get()
+            result[key] = bool(value) if key in ('ensemble','auto') else (int(value) if key in ('count','seed') else float(str(value).replace(',','.')))
+        if not 2<=result['count']<=64 or result['seed']<0:
+            raise ValueError('Генераций: 2–64; seed — неотрицательное целое.')
+        if not all(np.isfinite(result[k]) for k in ('ref_margin','target_margin','shift','tolerance')):
+            raise ValueError('Параметры должны быть конечными.')
+        if min(result['ref_margin'],result['target_margin'])<0 or result['tolerance']<=0:
+            raise ValueError('Запасы ≥ 0, допуск > 0.')
+        return result
+
+    def _auto_depth(self):
+        try:
+            ref,target = self._current()
+            if not ref or not target:
+                raise ValueError('Выберите опорную и целевую скважины.')
+            config = self._read_config()
+            p = auto_intervals(ref,target,self._groups_snapshot().get(ref.path,[]),self._read_params(),
+                               config['ref_margin'],config['target_margin'],config['shift'])
+            self._guard=True
+            for key in ('ref_start','ref_end','target_start','target_end'):
+                self.vars[key].set(f'{getattr(p,key):.6g}')
+            self._guard=False
+            self._input_changed()
+            self.status.set(f'Интервалы: {p.ref_start:.1f}–{p.ref_end:.1f} → {p.target_start:.1f}–{p.target_end:.1f} м')
+            self._settings()
+        except (ValueError,TypeError) as error:
+            self._guard=False
+            messagebox.showerror('Автоинтервалы',str(error),parent=self)
+
+    def _input_changed(self,*args):
+        if self._guard or self.busy:
+            return
+        for bundle in self.bundles:
+            bundle.result.provenance['settings_changed']=True
+        self.dirty=True
+        super()._input_changed(*args)
+        self._refresh_result_windows()
+
+    def _refresh_buttons(self):
+        super()._refresh_buttons()
+        if hasattr(self,'window_button'):
+            self.window_button.configure(state='normal' if self.bundles and not self.busy else 'disabled')
+
+    def _update_files(self):
+        super()._update_files()
+        if not hasattr(self,'available_list'):
+            return
+        self.available_list.delete(0,'end')
+        for label in self.wells:
+            self.available_list.insert('end',label)
+        valid = {w.path for w in self.wells.values()}
+        self.sequence_paths=[p for p in self.sequence_paths if p in valid]
+        self._sequence_render()
+
+    def _well_by_path(self,path):
+        return next(w for w in self.wells.values() if w.path==path)
+
+    def _sequence_render(self):
+        self.sequence_list.delete(0,'end')
+        for i,path in enumerate(self.sequence_paths):
+            well=self._well_by_path(path)
+            self.sequence_list.insert('end',f'{i+1}. {well.name} | {well.uwi or "без UWI"}')
+        self.sequence_group_box.configure(values=['']+sorted(self.groups))
+
+    def _sequence_add(self):
+        labels=list(self.wells)
+        for index in self.available_list.curselection():
+            path=self.wells[labels[index]].path
+            if path not in self.sequence_paths:
+                self.sequence_paths.append(path)
+        self._sequence_render()
+        self._input_changed()
+
+    def _sequence_remove(self):
+        if self.sequence_list.curselection():
+            del self.sequence_paths[self.sequence_list.curselection()[0]]
+            self._sequence_render()
+            self._input_changed()
+
+    def _drag_sequence_start(self,event):
+        self._sequence_drag_index=self.sequence_list.nearest(event.y)
+
+    def _drag_sequence(self,event):
+        if self.busy or not self.sequence_paths:
+            return
+        old=getattr(self,'_sequence_drag_index',0)
+        new=self.sequence_list.nearest(event.y)
+        if old!=new and 0<=old<len(self.sequence_paths):
+            self.sequence_paths.insert(new,self.sequence_paths.pop(old))
+            self._sequence_drag_index=new
+            self._sequence_render()
+            self.sequence_list.selection_set(new)
+            self._sequence_selection()
+            self._input_changed()
+
+    def _sequence_selection(self,event=None):
+        selected=self.sequence_list.curselection()
+        if selected:
+            well=self._well_by_path(self.sequence_paths[selected[0]])
+            self.sequence_group.set(self.assignments.get(well.path,match_group(well,self.groups)))
+
+    def _assign_sequence_group(self,event=None):
+        selected=self.sequence_list.curselection()
+        if selected:
+            self.assignments[self.sequence_paths[selected[0]]]=self.sequence_group.get()
+            self._pair_changed()
+
+    def _groups_snapshot(self):
+        mapping={w.path:list(self.groups.get(self.assignments.get(w.path,match_group(w,self.groups)),[])) for w in self.wells.values()}
+        for well,var in zip(self._current(),(self.rgroup_var,self.tgroup_var)):
+            if well:
+                mapping[well.path]=list(self.groups.get(var.get(),[]))
+        # User-confirmed picks are interpreted labels, not automatic pseudo-labels.
+        for well in self.wells.values():
+            values={_key(m.name):m for m in mapping[well.path]}
+            for name,row in self.manual_picks.get(well.path,{}).items():
+                if row.get('confirmed') and row.get('predicted_md') is not None:
+                    values[name]=Marker(row['marker'],well.name,well.uwi,row['predicted_md'])
+            mapping[well.path]=sorted(values.values(),key=lambda m:m.md)
+        return mapping
+
+    def _run(self):
+        self._run_mode('pair')
+
+    def _run_mode(self,mode,start_index=None):
+        if self.busy:
+            return
+        try:
+            params,config=self._read_params(),self._read_config()
+            curves=self._selected_curves()
+            if not curves:
+                raise ValueError('Выберите кривые для расчёта.')
+            mapping=self._groups_snapshot()
+            manual_picks=copy.deepcopy(self.manual_picks)
+            calibration_context=copy.deepcopy(self.calibration_context)
+            prefix=[]
+            initial=None
+            if mode=='sequence':
+                if start_index is None:
+                    wells=[self._well_by_path(p) for p in self.sequence_paths]
+                else:
+                    prefix=self.bundles[:start_index+1]
+                    prefix_paths=[prefix[0].result.ref.path]+[b.result.target.path for b in prefix]
+                    if self.sequence_paths[:len(prefix_paths)]==prefix_paths:
+                        wells=[self._well_by_path(p) for p in self.sequence_paths[len(prefix_paths)-1:]]
+                    else:
+                        wells=[prefix[-1].result.target]+[b.result.target for b in self.bundles[start_index+1:]]
+                    initial=output_markers(prefix[-1].result)
+                    following=self.bundles[start_index+1] if start_index+1<len(self.bundles) else prefix[-1]
+                    config=dict(following.config)
+                    params=Params(**config.get('base_params',asdict(following.result.params)))
+                    curves=config.get('requested_curves',following.result.curves)
+                if len(wells)<2:
+                    raise ValueError('Добавьте минимум две скважины в последовательный набор.')
+            else:
+                ref,target=self._current()
+                if not ref or not target or ref.path==target.path:
+                    raise ValueError('Выберите две разные скважины.')
+                rm,tm=mapping[ref.path],mapping[target.path]
+                if mode=='tune' and (not rm or not tm):
+                    raise ValueError('Для подбора нужны маркеры обеих скважин.')
+        except (ValueError,TypeError,StopIteration) as error:
+            messagebox.showerror('Расчёт',str(error),parent=self)
+            return
+        def work():
+            cb=lambda f,s:self.messages.put(('progress',(f,s)))
+            if mode=='sequence':
+                bundles,errors=run_sequence(wells,mapping,curves,params,config,self.cancel_event,cb,initial,manual_picks)
+                flag_reused_calibration(bundles,calibration_context)
+                return 'analysis',dict(bundles=prefix+bundles,errors=errors,mode=mode)
+            if config['ensemble'] or mode=='tune':
+                bundle=run_ensemble(ref,target,curves,params,rm,tm,config['count'],config['seed'],config['tolerance'],self.cancel_event,cb,mode=='tune')
+                bundle.config.update(config)
+            else:
+                bundle=RunBundle(correlate(ref,target,curves,params,rm,tm,self.cancel_event,cb),config=config)
+            if mode!='tune':
+                reapply_manual(bundle.result,manual_picks.get(target.path,{}))
+                flag_reused_calibration([bundle],calibration_context)
+            return 'analysis',dict(bundles=[bundle],errors=[],mode=mode)
+        self.status.set('Запуск подбора…' if mode=='tune' else 'Расчёт…')
+        self._start_worker(work)
+
+    def _handle_extra(self,kind,payload):
+        if kind=='saved':
+            self.project_path=payload
+            self.dirty=False
+            self.status.set(f'Проект сохранён: {payload}')
+            return
+        if kind=='project':
+            path,data=payload
+            self._set_busy(False)
+            self._restore_project(data)
+            self.project_path=path
+            self.dirty=False
+            self.status.set(f'Проект открыт: {path}')
+            return
+        self.bundles=payload['bundles']
+        self.dirty=True
+        if self.bundles:
+            self.result=self.bundles[-1].result
+            self._show_result()
+        else:
+            self.result=None
+        self.sequence_status.configure(text=f'Рассчитано пар: {len(self.bundles)}' + ('; '+ '; '.join(payload['errors']) if payload['errors'] else ''))
+        self._refresh_result_windows()
+        if payload['mode']=='tune' and self.bundles:
+            self._open_result()
+        if payload['errors']:
+            messagebox.showwarning('Последовательность остановлена', '\n'.join(payload['errors']),parent=self)
+
+    def _open_result(self):
+        if self.bundles:
+            window=CorrelationWindow(self)
+            self.result_windows.append(window)
+
+    def _refresh_result_windows(self):
+        self.result_windows=[w for w in self.result_windows if w.winfo_exists()]
+        for window in self.result_windows:
+            window.refresh()
+
+    def _manual_changed(self,index):
+        self.dirty=True
+        result=self.bundles[index].result
+        picks=self.manual_picks.setdefault(result.target.path,{})
+        picks.update({_key(row['marker']):copy.deepcopy(row) for row in result.rows if row.get('confirmed')})
+        for bundle in self.bundles[index+1:]:
+            bundle.result.provenance['stale']=True
+        self.result=self.bundles[index].result
+        self._show_result()
+        self._refresh_result_windows()
+
+    def _apply_best(self,index):
+        result=self.bundles[index].result
+        if result.provenance.get('mode')=='tuned':
+            self.calibration_context[result.target.path]=dict(source=result.ref.path,
+                control_names=result.provenance.get('control_names',[]),params=asdict(result.params))
+        self._guard=True
+        for key,value in asdict(result.params).items():
+            self.vars[key].set('' if value is None else str(value))
+        labels=list(self.wells)
+        self.ref_var.set(next(k for k in labels if self.wells[k].path==result.ref.path))
+        self.target_var.set(next(k for k in labels if self.wells[k].path==result.target.path))
+        self.rgroup_var.set(self.assignments.get(result.ref.path,match_group(result.ref,self.groups)))
+        self.tgroup_var.set(self.assignments.get(result.target.path,match_group(result.target,self.groups)))
+        self.curve_list.delete(0,'end')
+        common=sorted(set(result.ref.curves)&set(result.target.curves))
+        for i,name in enumerate(common):
+            self.curve_list.insert('end',name)
+            if name in result.curves:
+                self.curve_list.selection_set(i)
+        self._guard=False
+        self.dirty=True
+        self.status.set('Параметры лучшего проверенного варианта применены. Оценка остаётся результатом подбора.')
+        self._settings()
+
+    def _project_ui(self):
+        return dict(params={k:v.get() for k,v in self.vars.items()},config={k:v.get() for k,v in self.config_vars.items()},
+                    sequence=self.sequence_paths,assignments=self.assignments,curves=self._selected_curves(),
+                    manual_picks=self.manual_picks,
+                    calibration_context=self.calibration_context,
+                    ref=self._current()[0].path if self._current()[0] else None,
+                    target=self._current()[1].path if self._current()[1] else None,
+                    marker_path=getattr(self,'marker_path',''))
+
+    def _save_project(self):
+        if self.busy:
+            return
+        path=filedialog.asksaveasfilename(parent=self,title='Сохранить проект',defaultextension='.idtw',
+                                         initialfile=Path(self.project_path).name if self.project_path else 'correlation.idtw',filetypes=[('IDTW project','*.idtw')])
+        if not path:
+            return
+        wells,markers,bundles,ui=list(self.wells.values()),list(self.markers),list(self.bundles),self._project_ui()
+        def work():
+            save_project(path,wells,markers,bundles,ui)
+            return 'saved',path
+        self._start_worker(work)
+        self.cancel_button.configure(state='disabled')
+
+    def _open_project(self):
+        if self.busy:
+            return
+        path=filedialog.askopenfilename(parent=self,title='Открыть проект',filetypes=[('IDTW project','*.idtw')])
+        if path:
+            self._start_worker(lambda:('project',(path,load_project(path))))
+
+    def _restore_project(self,data):
+        wells,markers,bundles,ui=data
+        self._guard=True
+        self.set_dataset(wells,markers)
+        self._guard=True
+        for key,value in ui.get('params',{}).items():
+            if key in self.vars:
+                self.vars[key].set(value)
+        for key,value in ui.get('config',{}).items():
+            if key in self.config_vars:
+                self.config_vars[key].set(value)
+        self.assignments=ui.get('assignments',{})
+        self.manual_picks=ui.get('manual_picks',{})
+        self.calibration_context=ui.get('calibration_context',{})
+        for var,key in ((self.ref_var,'ref'),(self.target_var,'target')):
+            var.set(next((label for label,w in self.wells.items() if w.path==ui.get(key)),''))
+        self._pair_changed()
+        self._guard=True
+        self.curve_list.selection_clear(0,'end')
+        for i in range(self.curve_list.size()):
+            if self.curve_list.get(i) in ui.get('curves',[]):
+                self.curve_list.selection_set(i)
+        self.sequence_paths=[p for p in ui.get('sequence',[]) if p in {w.path for w in wells}]
+        self.marker_path=ui.get('marker_path','снимок проекта')
+        self.bundles=bundles
+        self.result=bundles[-1].result if bundles else None
+        self._guard=False
+        self._update_files()
+        if self.result:
+            self._show_result()
+        self._refresh_buttons()
+        self._refresh_result_windows()
+
+    def _draw(self):
+        super()._draw()
+        # The detailed result window uses marker-specific colours and ranges.
+
+
+class CorrelationWindow(tk.Toplevel):
+    """Independent result viewport; every plotted object belongs to a snapshot."""
+    def __init__(self,app):
+        super().__init__(app)
+        self.app=app
+        self.title('Результат корреляции — набор, варианты, маркеры')
+        self.geometry('1320x880')
+        self.minsize(900,620)
+        self.low=None
+        self.high=None
+        self._drag=None
+        self._track_info=[]
+        self.pair_var=tk.StringVar(value='Весь набор')
+        self.variant_var=tk.StringVar(value='Итог')
+        self.curve_var=tk.StringVar()
+        bar=ttk.Frame(self,padding=8)
+        bar.pack(fill='x')
+        ttk.Label(bar,text='Просмотр:').pack(side='left')
+        self.pair_box=ttk.Combobox(bar,textvariable=self.pair_var,state='readonly',width=33)
+        self.pair_box.pack(side='left',padx=5)
+        self.pair_box.bind('<<ComboboxSelected>>',lambda e:self.refresh(reset=True))
+        self.variant_box=ttk.Combobox(bar,textvariable=self.variant_var,state='readonly',width=22)
+        self.variant_box.pack(side='left',padx=5)
+        self.variant_box.bind('<<ComboboxSelected>>',lambda e:self.refresh(reset=True))
+        self.curve_box=ttk.Combobox(bar,textvariable=self.curve_var,state='readonly',width=12)
+        self.curve_box.pack(side='left',padx=5)
+        self.curve_box.bind('<<ComboboxSelected>>',lambda e:self.draw())
+        ttk.Button(bar,text='Весь диапазон',command=self.reset_view).pack(side='left',padx=5)
+        ttk.Label(self,text='Колесо — глубина; Shift + колесо — масштаб; перетаскивание — глубина. '
+                  'Цвет обозначает маркер; точка — исходный контроль, ромб — ручное подтверждение.').pack(anchor='w',padx=10)
+        self.banner=ttk.Label(self,text='',wraplength=1240,foreground='#9b4b08')
+        self.banner.pack(fill='x',padx=10,pady=3)
+        tabs=ttk.Notebook(self)
+        tabs.pack(fill='both',expand=True,padx=8,pady=5)
+        graph=ttk.Frame(tabs)
+        tableframe=ttk.Frame(tabs)
+        details=ttk.Frame(tabs)
+        tabs.add(graph,text='Корреляционный профиль')
+        tabs.add(tableframe,text='Маркеры и ручные правки')
+        tabs.add(details,text='Генерации и метрики')
+        self.canvas=tk.Canvas(graph,background='#fafbfd',highlightthickness=0)
+        scrollbar=ttk.Scrollbar(graph,orient='horizontal',command=self.canvas.xview)
+        self.canvas.configure(xscrollcommand=scrollbar.set)
+        scrollbar.pack(side='bottom',fill='x')
+        self.canvas.pack(fill='both',expand=True)
+        self.canvas.bind('<Configure>',lambda e:self.draw())
+        self.canvas.bind('<MouseWheel>',self.wheel)
+        self.canvas.bind('<Button-4>',self.wheel)
+        self.canvas.bind('<Button-5>',self.wheel)
+        self.canvas.bind('<ButtonPress-1>',lambda e:setattr(self,'_drag',(e.y,self.low,self.high)))
+        self.canvas.bind('<B1-Motion>',self.pan)
+        self.canvas.bind('<ButtonRelease-1>',lambda e:setattr(self,'_drag',None))
+        self.canvas.bind('<Motion>',self.hover)
+        self.hint=tk.StringVar(value='')
+        ttk.Label(self,textvariable=self.hint).pack(fill='x',padx=10,pady=4)
+        cols=('pair','marker','predicted_md','original_md','actual_md','error','p10','p90','support','status')
+        self.table=ttk.Treeview(tableframe,columns=cols,show='headings',selectmode='browse')
+        for key,title in zip(cols,('Пара','Маркер','MD прогноз','MD до правки','MD контроль','Ошибка','P10','P90','Поддержка','Статус')):
+            self.table.heading(key,text=title)
+            self.table.column(key,width=85 if key not in ('pair','status') else 180,stretch=True)
+        ys=ttk.Scrollbar(tableframe,command=self.table.yview)
+        xs=ttk.Scrollbar(tableframe,orient='horizontal',command=self.table.xview)
+        self.table.configure(yscrollcommand=ys.set,xscrollcommand=xs.set)
+        buttons=ttk.Frame(tableframe)
+        buttons.pack(side='bottom',fill='x',pady=5)
+        ttk.Button(buttons,text='Исправить / подтвердить…',command=self.edit_selected).pack(side='left',padx=4)
+        ttk.Button(buttons,text='Пересчитать после этой скважины',command=self.recalculate_after).pack(side='left',padx=4)
+        ttk.Button(buttons,text='История правок',command=self.history).pack(side='left',padx=4)
+        xs.pack(side='bottom',fill='x')
+        ys.pack(side='right',fill='y')
+        self.table.pack(fill='both',expand=True)
+        self.table.bind('<Double-1>',lambda e:self.edit_selected())
+        self.details=tk.Text(details,wrap='word',font=('Consolas',10))
+        scroll=ttk.Scrollbar(details,command=self.details.yview)
+        self.details.configure(yscrollcommand=scroll.set)
+        applybar=ttk.Frame(details)
+        applybar.pack(side='bottom',fill='x',pady=4)
+        ttk.Button(applybar,text='Применить параметры итогового варианта пары',command=self.apply_best).pack(side='left')
+        scroll.pack(side='right',fill='y')
+        self.details.pack(fill='both',expand=True)
+        self.refresh(reset=True)
+
+    def _pair_index(self):
+        value=self.pair_var.get()
+        if value=='Весь набор':
+            return None
+        try:
+            index=int(value.split('.',1)[0])-1
+            return index if 0<=index<len(self.app.bundles) else None
+        except ValueError:
+            return None
+
+    def viewed(self):
+        index=self._pair_index()
+        if index is None:
+            return [(i,b.result) for i,b in enumerate(self.app.bundles)]
+        bundle=self.app.bundles[index]
+        if self.variant_var.get().startswith('Генерация '):
+            gen=int(self.variant_var.get().split()[-1])
+            result=next((r for r in bundle.candidates if r.provenance.get('generation')==gen),bundle.result)
+        else:
+            result=bundle.result
+        return [(index,result)]
+
+    def refresh(self,reset=False):
+        if not self.winfo_exists():
+            return
+        labels=['Весь набор']+[f'{i+1}. {b.result.ref.name} → {b.result.target.name}' for i,b in enumerate(self.app.bundles)]
+        self.pair_box.configure(values=labels)
+        if len(labels)==2 and self.pair_var.get()=='Весь набор':
+            self.pair_var.set(labels[1])
+        if self.pair_var.get() not in labels:
+            self.pair_var.set(labels[1] if len(labels)==2 else labels[0])
+        index=self._pair_index()
+        variants=['Итог']+([f'Генерация {r.provenance["generation"]}' for r in self.app.bundles[index].candidates] if index is not None else [])
+        self.variant_box.configure(values=variants)
+        if self.variant_var.get() not in variants:
+            self.variant_var.set('Итог')
+        viewed=self.viewed()
+        curves=sorted({c for _,r in viewed for c in r.curves})
+        self.curve_box.configure(values=curves)
+        if self.curve_var.get() not in curves:
+            self.curve_var.set(curves[0] if curves else '')
+        for item in self.table.get_children():
+            self.table.delete(item)
+        warnings=[]
+        text=[]
+        for i,result in viewed:
+            if self.app.bundles[i].result.provenance.get('mode')=='tuned' or self.app.bundles[i].result.provenance.get('calibrated_on_target'):
+                warnings.append('Подбор по контрольной разметке: показанная ошибка не является независимой проверкой.')
+            if result.provenance.get('stale'):
+                warnings.append('Есть результаты, устаревшие после ручной правки. Пересчитайте следующие пары.')
+            if result.provenance.get('settings_changed'):
+                warnings.append('Показан сохранённый результат прежних настроек; текущие настройки изменены.')
+            for j,row in enumerate(result.rows):
+                values=[f'{i+1}',row['marker']]+[self.app._fmt(row.get(k)) for k in ('predicted_md','original_md','actual_md','error','p10','p90','support','status')]
+                self.table.insert('', 'end',iid=f'{i}:{j}',values=values)
+            text.append(f'Пара {i+1}: {result.ref.name} → {result.target.name}\n')
+            text.extend(f'{key}: {self.app._fmt(value)}\n' for key,value in result.stats.items())
+            text.append('Параметры показанного пути: '+json.dumps(asdict(result.params),ensure_ascii=False)+'\n')
+            text.append('Кривые: '+', '.join(result.curves)+'\n')
+            for item in self.app.bundles[i].report:
+                text.append(f"Генерация {item['generation']}{' [ВЫБРАНА]' if item.get('selected') else ''}: " +
+                            json.dumps(_json_clean(item),ensure_ascii=False)+'\n')
+            for row in result.rows:
+                if row.get('alternatives'):
+                    text.append(f"Альтернативы {row['marker']}: "+json.dumps(row['alternatives'],ensure_ascii=False)+'\n')
+            text.append('\n')
+        self.banner.configure(text=' '.join(dict.fromkeys(warnings)) or 'P10–P90 — чувствительность автоматических генераций внутри группы, до ручных правок. Поддержка — доля генераций, не вероятность.')
+        self.details.configure(state='normal')
+        self.details.delete('1.0','end')
+        self.details.insert('1.0',''.join(text))
+        self.details.configure(state='disabled')
+        if reset or self.low is None:
+            self.reset_view()
+        else:
+            self.draw()
+
+    def reset_view(self):
+        viewed=self.viewed()
+        if viewed:
+            self.low=min(min(r.zr[0],r.zt[0]) for _,r in viewed)
+            self.high=max(max(r.zr[-1],r.zt[-1]) for _,r in viewed)
+        else:
+            self.low,self.high=0.,100.
+        self.draw()
+
+    def wheel(self,event):
+        if self.low is None:
+            return
+        direction=1 if getattr(event,'num',None)==4 or getattr(event,'delta',0)>0 else -1
+        span=self.high-self.low
+        if getattr(event,'state',0)&1:
+            fraction=np.clip((event.y-45)/max(1,self.canvas.winfo_height()-85),0,1)
+            anchor=self.low+fraction*span
+            span=max(.05,span*(.8 if direction>0 else 1.25))
+            self.low=anchor-fraction*span
+            self.high=self.low+span
+        else:
+            self.low-=direction*.1*span
+            self.high-=direction*.1*span
+        self.draw()
+
+    def pan(self,event):
+        if self._drag:
+            y,low,high=self._drag
+            shift=(event.y-y)*(high-low)/max(1,self.canvas.winfo_height()-85)
+            self.low,self.high=low-shift,high-shift
+            self.draw()
+
+    def draw(self):
+        canvas=self.canvas
+        canvas.delete('all')
+        viewed=self.viewed()
+        h,w=canvas.winfo_height(),canvas.winfo_width()
+        if not viewed or h<100 or w<100 or self.low is None:
+            return
+        top,bottom=50,h-35
+        self._track_info=[]
+        wells=[viewed[0][1].ref]+[r.target for _,r in viewed]
+        bounds=[(viewed[0][1].zr[0],viewed[0][1].zr[-1])]+[(r.zt[0],r.zt[-1]) for _,r in viewed]
+        width=max(w,len(wells)*285)
+        track_width=width/len(wells)
+        canvas.configure(scrollregion=(0,0,width,h))
+        def y(md):
+            return top+(md-self.low)/(self.high-self.low)*(bottom-top)
+        def mark(x0,x1,md,name,kind='predicted',uncertain=False):
+            yy=y(md)
+            if not top<=yy<=bottom:
+                return
+            color=marker_color(name)
+            canvas.create_line(x0,yy,x1,yy,fill=color,width=2,dash=(4,3) if uncertain else ())
+            canvas.create_text(x1-2,yy-3,text=name[:22],anchor='se',fill=color,font=('Segoe UI',9))
+            if kind=='manual':
+                canvas.create_polygon(x1-6,yy-5,x1-1,yy,x1-6,yy+5,x1-11,yy,fill=color,outline=color)
+            elif kind=='control':
+                canvas.create_oval(x0-4,yy-4,x0+4,yy+4,fill=color,outline=color)
+        curve=self.curve_var.get()
+        tracks=[]
+        for index,(well,(start,end)) in enumerate(zip(wells,bounds)):
+            x0,x1=index*track_width+65,(index+1)*track_width-48
+            tracks.append((x0,x1))
+            self._track_info.append((x0,x1,well))
+            canvas.create_rectangle(x0,top,x1,bottom,fill='white',outline='#b8c5d2')
+            canvas.create_text((x0+x1)/2,14,text=well.name[:30],font=('Segoe UI',10,'bold'))
+            canvas.create_text((x0+x1)/2,33,text=f'{curve} ({well.units.get(curve, "")}) · MD, м',fill='#526778')
+            for md in np.linspace(self.low,self.high,9):
+                yy=y(md)
+                canvas.create_line(x0,yy,x1,yy,fill='#edf0f4')
+                canvas.create_text(x0-5,yy,text=f'{md:.1f}',anchor='e',font=('Segoe UI',9))
+            values=well.curves.get(curve)
+            if values is not None:
+                usable=np.isfinite(values)&(well.depth>=start)&(well.depth<=end)
+                visible=usable&(well.depth>=self.low)&(well.depth<=self.high)
+                if usable.any():
+                    xmin,xmax=float(np.min(values[usable])),float(np.max(values[usable]))
+                    scale=max(1e-12,xmax-xmin)
+                    indices=np.flatnonzero(visible)
+                    breaks=(np.diff(indices)>1)|(np.diff(well.depth[indices])>viewed[min(index,len(viewed)-1)][1].params.gap)
+                    for block in np.split(indices,np.flatnonzero(breaks)+1):
+                        if len(block)<2:
+                            continue
+                        take=np.unique(np.r_[block[::max(1,len(block)//1600)],block[-1]])
+                        points=[]
+                        for sample in take:
+                            points.extend((x0+(values[sample]-xmin)/scale*(x1-x0),y(well.depth[sample])))
+                        canvas.create_line(*points,fill='#285f91',width=1.1)
+                    canvas.create_text(x0,bottom+15,text=f'{xmin:.3g}',anchor='w')
+                    canvas.create_text(x1,bottom+15,text=f'{xmax:.3g}',anchor='e')
+            else:
+                canvas.create_text((x0+x1)/2,(top+bottom)/2,text='Кривая отсутствует',fill='#8a6470')
+        for marker in viewed[0][1].reference_markers:
+            mark(*tracks[0],marker.md,marker.name,'control')
+        for index,(_,result) in enumerate(viewed):
+            x0,x1=tracks[index+1]
+            for row in result.rows:
+                md=row.get('predicted_md')
+                if md is None:
+                    continue
+                color=marker_color(row['marker'])
+                if row.get('p10') is not None and row.get('p90') is not None:
+                    ya,yb=max(top,y(row['p10'])),min(bottom,y(row['p90']))
+                    if ya<=yb:
+                        canvas.create_rectangle(x0,ya,x1,yb,fill=color,stipple='gray25',outline='')
+                uncertain='провер' in row['status'].lower()
+                mark(x0,x1,md,row['marker'],'manual' if row.get('confirmed') else 'predicted',uncertain)
+                yr,yt=y(row['ref_md']),y(md)
+                if top<=yr<=bottom and top<=yt<=bottom:
+                    canvas.create_line(tracks[index][1],yr,x0,yt,fill=color,width=2,dash=(5,3) if uncertain else ())
+                for alternative in row.get('alternatives',[]):
+                    ya=y(alternative['md'])
+                    if top<=ya<=bottom:
+                        canvas.create_line(x0,ya,x1,ya,fill=color,dash=(2,5))
+                        canvas.create_text(x0+3,ya+3,text=f"альт. {alternative['votes']}/{alternative['total']}",anchor='nw',fill=color,font=('Segoe UI',8))
+            for marker in result.control_markers:
+                mark(x0,x1,marker.md,marker.name,'control')
+
+    def hover(self,event):
+        if self.low is None:
+            return
+        md=self.low+(event.y-50)/max(1,self.canvas.winfo_height()-85)*(self.high-self.low)
+        x=self.canvas.canvasx(event.x)
+        track=next(((i,w) for i,(lo,hi,w) in enumerate(self._track_info) if lo<=x<=hi),None)
+        if track is None:
+            return
+        index,well=track
+        viewed=self.viewed()
+        if index==0:
+            result=viewed[0][1]
+            ref_md=md
+            target_md=float(np.interp(md,result.zr,result.mapped)) if result.zr[0]<=md<=result.zr[-1] else None
+        else:
+            result=viewed[index-1][1]
+            if not result.zt[0]<=md<=result.zt[-1]:
+                self.hint.set(f'{well.name} MD {md:.2f} м — вне расчётного интервала')
+                return
+            j=int(np.argmin(abs(result.mapped-md)))
+            ref_md,target_md=float(result.zr[j]),md
+        row=min(result.rows,key=lambda r:abs((r['predicted_md'] if r.get('predicted_md') is not None else float('inf'))-(target_md if target_md is not None else 0)),default=None)
+        suffix=''
+        if row and row.get('predicted_md') is not None and target_md is not None and abs(row['predicted_md']-target_md)<(self.high-self.low)*.03:
+            suffix=f" · {row['marker']}: {row['status']}; S={self.app._fmt(row.get('semblance'))}; поддержка={self.app._fmt(row.get('support'))}"
+        self.hint.set(f'{well.name} MD {md:.2f} м · соответствие {ref_md:.2f} → {self.app._fmt(target_md)} м'+suffix)
+
+    def _selected_row(self):
+        selection=self.table.selection()
+        if not selection:
+            raise ValueError('Выберите строку маркера.')
+        index,row_index=map(int,selection[0].split(':'))
+        if self.variant_var.get()!='Итог':
+            raise ValueError('Переключитесь на «Итог» для ручного редактирования.')
+        return index,row_index,self.app.bundles[index].result.rows[row_index]
+
+    def edit_selected(self):
+        if self.app.busy:
+            return
+        try:
+            index,row_index,row=self._selected_row()
+        except ValueError as error:
+            messagebox.showerror('Маркер',str(error),parent=self)
+            return
+        dialog=tk.Toplevel(self)
+        dialog.title(f"Подтверждение {row['marker']}")
+        ttk.Label(dialog,text=f"Исходный автоматический прогноз: {self.app._fmt(row.get('original_md',row['predicted_md']))} м").pack(padx=15,pady=8)
+        md=tk.StringVar(value='' if row['predicted_md'] is None else str(row['predicted_md']))
+        comment=tk.StringVar()
+        ttk.Label(dialog,text='MD в целевой скважине, м:').pack(anchor='w',padx=15)
+        ttk.Entry(dialog,textvariable=md,width=35).pack(padx=15,pady=4)
+        ttk.Label(dialog,text='Комментарий:').pack(anchor='w',padx=15)
+        ttk.Entry(dialog,textvariable=comment,width=60).pack(padx=15,pady=4)
+        def accept():
+            if self.app.busy:
+                return
+            try:
+                edit_marker(self.app.bundles[index].result,row['marker'],float(md.get().replace(',','.')),comment.get())
+                self.app._manual_changed(index)
+                dialog.destroy()
+            except (ValueError,IndexError) as error:
+                messagebox.showerror('Правка',str(error),parent=dialog)
+        ttk.Button(dialog,text='Подтвердить',command=accept).pack(pady=12)
+        dialog.transient(self)
+        dialog.grab_set()
+
+    def recalculate_after(self):
+        try:
+            index,_,_=self._selected_row()
+            self.app._run_mode('sequence',start_index=index)
+        except ValueError as error:
+            messagebox.showerror('Пересчёт',str(error),parent=self)
+
+    def history(self):
+        try:
+            _,_,row=self._selected_row()
+            messagebox.showinfo('История правок',json.dumps(row.get('history',[]),ensure_ascii=False,indent=2),parent=self)
+        except ValueError as error:
+            messagebox.showerror('История',str(error),parent=self)
+
+    def apply_best(self):
+        if self.app.busy:
+            return
+        index=self._pair_index()
+        if index is None:
+            messagebox.showinfo('Параметры','Выберите конкретную пару в верхнем списке.',parent=self)
+        else:
+            self.app._apply_best(index)
 
 
 def launch_gui():
@@ -4777,7 +6151,7 @@ def gui_smoke():
             if len(app.canvas.find_all()) < 50 or app._plot is None:
                 raise AssertionError('Canvas plot was not rendered')
             before = app.result
-            app._zoom(SimpleNamespace(y=150,delta=120))
+            app._zoom(SimpleNamespace(y=150,delta=120,state=1))
             app._hover(SimpleNamespace(x=100,y=150))
             if not app._u1-app._u0 < 1 or app.result is not before:
                 raise AssertionError('Interactive zoom changed the result')
@@ -4801,6 +6175,117 @@ def gui_smoke():
         app._close()
 
 
+def advanced_gui_smoke():
+    from types import SimpleNamespace
+    app=IDTWApp()
+    app.withdraw()
+    failures=[]
+    app.report_callback_exception=lambda kind,error,trace:failures.append(str(error))
+    old_error,old_warning=messagebox.showerror,messagebox.showwarning
+    messagebox.showerror=lambda title,text,**kw:failures.append(text)
+    messagebox.showwarning=lambda title,text,**kw:failures.append(text)
+    def drain():
+        deadline=time.monotonic()+45
+        while app.busy and time.monotonic()<deadline:
+            app.update()
+            time.sleep(.01)
+        app.update()
+        if app.busy or failures:
+            raise AssertionError(str(failures or 'GUI timeout'))
+    try:
+        ref,target,rm,tm=_synthetic_case()
+        third=Well('third_gui.las','Скважина В','0003',target.depth+15,{'GR':target.curves['GR'].copy()},target.units.copy())
+        third_markers=[Marker(m.name,third.name,third.uwi,m.md+15) for m in tm]
+        app.set_dataset([ref,target,third],rm+tm+third_markers)
+        app._auto_depth()
+        app.settings_dialog.withdraw()
+        assert app.vars['ref_start'].get()=='0' and app.vars['target_end'].get()=='120'
+        for key in ('ref_start','ref_end','target_start','target_end'):
+            app.vars[key].set('')
+        app.config_vars['count'].set('4')
+        app.config_vars['auto'].set(False)
+        app.available_list.selection_set(0,2)
+        app._sequence_add()
+        assert app.sequence_paths==[ref.path,target.path,third.path]
+        app.geometry('1280x900+20000+20000')
+        app.deiconify()
+        app.notebook.select(1)
+        app.update()
+        box0,box1=app.sequence_list.bbox(0),app.sequence_list.bbox(1)
+        app._drag_sequence_start(SimpleNamespace(y=box0[1]+3))
+        app._drag_sequence(SimpleNamespace(y=box1[1]+3))
+        assert app.sequence_paths[:2]==[target.path,ref.path]
+        app._drag_sequence_start(SimpleNamespace(y=box1[1]+3))
+        app._drag_sequence(SimpleNamespace(y=box0[1]+3))
+        assert app.sequence_paths[:2]==[ref.path,target.path]
+        app._run_mode('sequence')
+        drain()
+        assert len(app.bundles)==2
+        app._open_result()
+        window=app.result_windows[-1]
+        window.geometry('1320x880+20000+20000')
+        app.update()
+        window.draw()
+        assert len(window.canvas.find_all())>60
+        span=window.high-window.low
+        low=window.low
+        window.wheel(SimpleNamespace(y=180,delta=-120,state=0))
+        assert abs(window.high-window.low-span)<1e-8 and window.low>low
+        window.wheel(SimpleNamespace(y=180,delta=120,state=1))
+        assert window.high-window.low<span
+        window.reset_view()
+        window.table.selection_set('0:0')
+        before=app.bundles[0].result.rows[0]['predicted_md']
+        window.edit_selected()
+        dialog=next(child for child in window.winfo_children() if isinstance(child,tk.Toplevel))
+        entries=[w for w in dialog.winfo_children() if isinstance(w,ttk.Entry)]
+        entries[0].delete(0,'end')
+        entries[0].insert(0,str(before+.2))
+        next(w for w in dialog.winfo_children() if isinstance(w,ttk.Button)).invoke()
+        assert app.bundles[0].result.rows[0]['confirmed'] and app.bundles[1].result.provenance['stale']
+        assert target.path in app.manual_picks
+        # Simulate a sequence that stopped before the third well: continue using
+        # the requested order, not just the already computed pair list.
+        app.bundles=app.bundles[:1]
+        app._run_mode('sequence',start_index=0)
+        drain()
+        assert abs(app.bundles[1].result.reference_markers[0].md-(before+.2))<1e-8
+        app._run_mode('tune')
+        drain()
+        assert app.bundles[0].result.provenance['mode']=='tuned'
+        window=app.result_windows[-1]
+        window.pair_var.set(window.pair_box['values'][1])
+        window.refresh()
+        window.variant_var.set(window.variant_box['values'][1])
+        window.refresh()
+        assert window.viewed()[0][1] in app.bundles[0].candidates
+        window.variant_var.set('Итог')
+        window.refresh()
+        app._apply_best(0)
+        assert float(app.vars['step'].get())==app.bundles[0].result.params.step
+        app.settings_dialog.withdraw()
+        app._run_mode('pair')
+        drain()
+        assert app.bundles[0].result.provenance.get('calibrated_on_target')
+        with tempfile.TemporaryDirectory(prefix='idtw_gui_project_') as directory:
+            path=str(Path(directory)/'project.idtw')
+            filedialog.asksaveasfilename=lambda **kw:path
+            app._save_project()
+            drain()
+            assert Path(path).exists()
+            filedialog.askopenfilename=lambda **kw:path
+            app._open_project()
+            drain()
+            assert len(app.wells)==3 and len(app.bundles)==1 and app.manual_picks[target.path]
+            assert app.sequence_paths==[ref.path,target.path,third.path]
+        if failures:
+            raise AssertionError(str(failures))
+        print('PASS: advanced GUI auto intervals, drag/drop, three wells, result window, wheel/Shift, manual pick, downstream recalculation, tuning, variant switch, apply settings, project save/load.')
+    finally:
+        app._close()
+        messagebox.showerror,messagebox.showwarning=old_error,old_warning
+
+
 def main():
     parser = argparse.ArgumentParser(description='IDTW: парная корреляция LAS и перенос маркеров, Tkinter GUI.')
     parser.add_argument('--self-test', action='store_true', help='Проверить алгоритм и форматы входных файлов без окна')
@@ -4809,8 +6294,10 @@ def main():
     args = parser.parse_args()
     if args.self_test:
         self_test()
+        advanced_self_test()
     elif args.gui_smoke:
         gui_smoke()
+        advanced_gui_smoke()
     elif args.demo:
         ref, target, rm, tm = _synthetic_case()
         app = IDTWApp()
